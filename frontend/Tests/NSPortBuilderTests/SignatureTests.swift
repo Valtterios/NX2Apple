@@ -74,7 +74,7 @@ final class SignatureTests: XCTestCase {
         XCTAssertEqual(command, ["/x", "xcodebuild", "-project", "/w/xcode/DmIOS.xcodeproj", "-scheme", "Test (0100)",
                                  "-configuration", "Release", "-destination", "id=UDID", "-derivedDataPath", "/w/xcode-derived-data",
                                  "-allowProvisioningUpdates", "DEVELOPMENT_TEAM=TEAM123456", "DM_COPY_ROMFS=NO",
-                                 "PRODUCT_BUNDLE_IDENTIFIER=org.nxnative.test", "build"])
+                                 "DM_COPY_GAME_RESOURCES=NO", "PRODUCT_BUNDLE_IDENTIFIER=org.nxnative.test", "build"])
     }
 
     /// An installed app's path names its work folder, and with it the project and derived data a re-sign must reuse.
