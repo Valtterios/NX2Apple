@@ -9,7 +9,7 @@ Fix or feature? A fix merges once CI is green, a feature after 48 hours. Maintai
 ## Checked
 
 <!-- Delete what does not apply. Say what was not checked too. -->
-- Tests: <!-- `cd frontend && swift test`, frontend-qt tests if you changed it, `python3 scripts/patches.py check` when `patches/` or a vendored path changed -->
+- Tests: <!-- `cd frontend && swift test`, frontend-qt tests if you changed it, `python3 tools/engine.py check --tree` when `patches/` or a vendored path changed -->
 - Visual QA: <!-- `NX_LAUNCHER_CAPTURE_DIR=<dir> swift test` captures the views, for a UI change -->
 - Run on a device or Mac: <!-- what was built, played or installed, with title ID and version, chip and OS -->
 
@@ -19,6 +19,6 @@ Fix or feature? A fix merges once CI is green, a feature after 48 hours. Maintai
 
 ## Scope
 
-- [ ] No vendored file (`dm/`, `scripts/`, `docs/`, `ref/`, `AGENTS.md`) is edited directly: a change there is a patch in `patches/` (`scripts/patches.py export`, and `patches.py check` passes), with its `Upstream-Status`
+- [ ] No vendored file (`dm/`, `scripts/`, `docs/`, `ref/`, `AGENTS.md`) is edited directly: a change there is a patch in `patches/` (a commit in `engine/`, then `tools/engine.py export`, and `tools/engine.py check --tree` passes), with its `Upstream-Status`
 - [ ] A fix to the engine or a game profile is also (or first) a PR at seedds/nxnative: this PR's patch says `forwarded seedds/nxnative#...`
 - [ ] No keys, game files or data extracted from a game in the change or the attachments
