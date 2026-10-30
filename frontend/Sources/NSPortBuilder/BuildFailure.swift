@@ -10,6 +10,8 @@ enum BuildFailureKind: String, CaseIterable {
     case keys, severalGames, noTitleID, driveMissing
     /// The build's and the install's own steps.
     case diskFull, teamTaken, noSigningAccount, deviceTransfer
+    /// The engine's online sync (tools/engine.py sync, Engine.swift): no network or GitHub unreachable, or any other stop of it.
+    case engineOffline, engineSync
     case unknown
 
     /// The script's override for this stop, offered as "Build anyway". Only these three have one that the launcher

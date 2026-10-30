@@ -125,6 +125,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             topBar
             Divider().opacity(0.3)
+            EngineSyncBanner(m: m)
             if page == .library {
                 libraryPage
             } else {
