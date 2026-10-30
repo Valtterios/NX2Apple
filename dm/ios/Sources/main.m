@@ -151,7 +151,7 @@ static int set_data_env(NSString *romfs, BOOL force) {
     }
     if (force) {   // at Play: shader libraries downloaded since the launch (GameDataSync.swift) are only found now; shmap_load reads DM_MSL_DIR when the game starts
         NSString *dl = [[gdir stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
-        if ([fm fileExistsAtPath:dl]) setenv("DM_MSL_DIR", [gdir stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 1);
+        if ([fm fileExistsAtPath:dl] || [fm fileExistsAtPath:[gdir stringByAppendingPathComponent:@"msl.tar"]]) setenv("DM_MSL_DIR", [gdir stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 1);
     }
     for (NSString *d in @[save_dir, temp_dir]) [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
     setenv("DM_SAVE", save_dir.fileSystemRepresentation, force);
@@ -247,7 +247,7 @@ static int boot_env(void) {
     // the app's shared <App>/msl.
     // A downloaded set (GameDataSync.swift) counts wherever the game files are: an IPA built with --shaders separate has no <App>/msl at all
     NSString *per_game_msl = [gdir stringByAppendingPathComponent:@"msl"];
-    BOOL downloaded_msl = [fm fileExistsAtPath:[per_game_msl stringByAppendingPathComponent:dm_shader_dir_name()]];
+    BOOL downloaded_msl = [fm fileExistsAtPath:[per_game_msl stringByAppendingPathComponent:dm_shader_dir_name()]] || [fm fileExistsAtPath:[gdir stringByAppendingPathComponent:@"msl.tar"]];   // the host reads <DM_MSL_DIR>.tar in place
     NSString *msl = ((per_game && [fm fileExistsAtPath:per_game_msl]) || downloaded_msl) ? per_game_msl : [res stringByAppendingPathComponent:@"msl"];
     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
     setenv("DM_FONT_DIR", [dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path

@@ -37,5 +37,6 @@ BOOL dm_have_shaders(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *own = [[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
     NSString *dl = [[dm_game_dir() stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
-    return [fm fileExistsAtPath:own] || [fm fileExistsAtPath:dl];
+    NSString *tar = [dm_game_dir() stringByAppendingPathComponent:@"msl.tar"];   // read in place by the host (nvn_mtl.m msl_pack_open)
+    return [fm fileExistsAtPath:own] || [fm fileExistsAtPath:dl] || [fm fileExistsAtPath:tar];
 }

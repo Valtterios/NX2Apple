@@ -23,5 +23,5 @@ int dm_romfs_status(NSString *path);
 /// The shader library folder this build loads ("b-<translation chain version>", dm/gfx/nvn/dmsh_chain.h).
 NSString *dm_shader_dir_name(void);
 
-/// YES when the app has shader libraries to run with: its own <App>/msl, or a downloaded games/<title ID>/msl/b-<version>.
+/// YES when the app has shader libraries to run with: its own <App>/msl, or a downloaded games/<title ID>/msl.tar (or an unpacked msl/b-<version>).
 BOOL dm_have_shaders(void);

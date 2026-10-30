@@ -26,9 +26,9 @@ final class GameDataModel: ObservableObject {
 
     var expected: String? { dm_expected_romfs_identity() }
     var imagePath: String { gameDir.appendingPathComponent("romfs.img").path }
-    var hasPartial: Bool { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("romfs.img.part.json").path) || FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("msl.part.json").path) }
+    var hasPartial: Bool { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("romfs.img.part.json").path) || FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("msl.tar.part.json").path) }
     var imageOK: Bool { dm_romfs_status(imagePath) == 0 }
-    var hasAny: Bool { ["romfs.img", "romfs.img.part", "msl", "msl.part"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
+    var hasAny: Bool { ["romfs.img", "romfs.img.part", "msl.tar", "msl.tar.part", "msl"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
 
     func refresh() {
         let want = expected.flatMap { romfsIdentityField($0, "version") } ?? ""
@@ -69,9 +69,9 @@ final class GameDataModel: ObservableObject {
                 let ownShaders = Bundle.main.resourceURL.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("msl").appendingPathComponent(dm_shader_dir_name()).path) } ?? false
                 if let s = m.shaders, !ownShaders {   // an IPA that carries its shaders (the default build) does not fetch them again
                     if let d = s.dir, d != dm_shader_dir_name() { throw GameDataError.mismatch("The server's shaders are \(d), this app needs \(dm_shader_dir_name()): publish them from the same build as the app.") }
-                    try await sync.syncTar(s, base: base, into: "msl")
+                    try await sync.syncFile(s, base: base, name: "msl.tar")
                 }
-                try await sync.syncImage(m.romfs, base: base) { dm_romfs_status($0.path) == 0 }
+                try await sync.syncFile(m.romfs, base: base, name: "romfs.img") { dm_romfs_status($0.path) == 0 }
                 self?.finish("Done: \(m.name ?? "game data") \(m.version) is ready. Press Play.")
             } catch is CancellationError {
                 self?.finish("Paused. Download resumes where it stopped.")
