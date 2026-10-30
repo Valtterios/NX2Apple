@@ -32,7 +32,7 @@ targets:
         CFBundleDisplayName: ${DM_DISPLAY_NAME}   # the game name in the base NSP (set by build_ipa.sh)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         CFBundleShortVersionString: $(MARKETING_VERSION)
-        UILaunchStoryboardName: ""
+        UILaunchScreen: {}   # a launch screen (an empty one: black) declares the app fits every screen size; without it iOS runs it zoomed in a legacy phone-sized frame (seen on the foldable iPhone's inner screen)
         UIFileSharingEnabled: true          # Documents (log.txt, saves) visible in the Files app
         LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations:
