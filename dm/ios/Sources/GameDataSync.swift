@@ -40,7 +40,7 @@ final class GameDataModel: ObservableObject {
     }
     var imagePath: String { gameDir.appendingPathComponent("romfs.img").path }
     var hasPartial: Bool { ["romfs.img.part.json", "msl.tar.part.json"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
-    static func identifier(_ title: String) -> String { "org.nxnative.gamedata." + title }   // one background session per game: two games in one LiveContainer do not share it
+    nonisolated static func identifier(_ title: String) -> String { "org.nxnative.gamedata." + title }   // one background session per game: two games in one LiveContainer do not share it
     var imageOK: Bool { dm_romfs_status(imagePath) == 0 }
     var hasAny: Bool { ["romfs.img", "romfs.img.part", "msl.tar", "msl.tar.part", "msl"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
 
