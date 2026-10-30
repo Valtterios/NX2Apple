@@ -4,6 +4,8 @@
 import SwiftUI
 import UIKit
 
+private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
+
 @MainActor
 final class GameDataModel: ObservableObject {
     @Published var server: String { didSet { UserDefaults.standard.set(server, forKey: "gamedata.server") } }
@@ -29,6 +31,13 @@ final class GameDataModel: ObservableObject {
     }
 
     var expected: String? { dm_expected_romfs_identity() }
+    /// The download folder as the Files app shows it: inside LiveContainer, below its Data/Application/<app folder>/
+    var whereShown: String {
+        let p = gameDir.path
+        if let r = p.range(of: "/Data/Application/") { return "LiveContainer › Data › Application › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
+        if let r = p.range(of: "/Documents/") { return "On My iPhone › \((info("CFBundleDisplayName") as? String) ?? "the game") › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
+        return p
+    }
     var imagePath: String { gameDir.appendingPathComponent("romfs.img").path }
     var hasPartial: Bool { ["romfs.img.part.json", "msl.tar.part.json"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
     static func identifier(_ title: String) -> String { "org.nxnative.gamedata." + title }   // one background session per game: two games in one LiveContainer do not share it
@@ -167,9 +176,13 @@ struct GameDataServerSection: View {
                 }
             }
         } header: {
-            Text("Game data server")
+            Text("Game data")
         } footer: {
-            Text(m.note.isEmpty ? "Downloads this game's files from your own server. In the background, iOS keeps fetching while you use other apps (if it does not inside LiveContainer, turn it off and keep the app open). It resumes if interrupted. Deleting frees the space and keeps your saves." : m.note)
+            VStack(alignment: .leading, spacing: 6) {
+                if !m.note.isEmpty { Text(m.note) }
+                Text("Downloads this game's files from your server, and resumes if interrupted. Delete frees the space and keeps your saves.")
+                Text("In Files: \(m.whereShown)").font(.caption.monospaced())
+            }
         }
     }
 }

@@ -23,20 +23,22 @@ private struct GameDataSection: View {
     var body: some View {
         Section {
             HStack {
-                Text("Game data")
+                Text("Using")
                 Spacer()
-                Text(picked.isEmpty ? "This app's folder" : (picked as NSString).lastPathComponent)
+                Text(picked.isEmpty ? "the download (or a copy in this app)" : (picked as NSString).lastPathComponent)
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
-            Button(picked.isEmpty ? "Choose game data…" : "Choose a different location…") { picking = true }
+            Button(picked.isEmpty ? "Choose a file instead…" : "Choose a different file…") { picking = true }
             if !picked.isEmpty {
                 Button("Use the app's own data again", role: .destructive) {
                     dm_clear_picked_data(); refresh(); note = ""
                 }
             }
+        } header: {
+            Text("Or: a file you copied, or an external drive")
         } footer: {
             Text(note.isEmpty
-                 ? "Pick the game's romfs.img or its RomFS folder — an external drive or iCloud Drive works. The app remembers the choice; a re-signed build asks once more."
+                 ? "Only for game files you put on the phone yourself. A chosen file is used instead of the download; “Use the app's own data again” goes back to the download (nothing is deleted)."
                  : note)
         }
         .sheet(isPresented: $picking) {
@@ -152,52 +154,24 @@ private struct LauncherView: View {
     let play: () -> Void
     @State private var memory = os_proc_available_memory()
 
+    @State private var showAdvanced = false
+
     var body: some View {
         GeometryReader { geometry in
-            HStack(spacing: 0) {
-                VStack(spacing: 16) {
-                    if let icon = appIcon() {
-                        Image(uiImage: icon).resizable().frame(width: 96, height: 96)
-                            .clipShape(RoundedRectangle(cornerRadius: 22))
-                            .accessibilityHidden(true)
-                    }
-                    Text((info("CFBundleDisplayName") as? String) ?? "Game")
-                        .font(.title.weight(.bold)).multilineTextAlignment(.center)
-                    Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
-                        .font(.callout).foregroundStyle(.secondary)
-                    playButton
+            // Wide: a narrow column for the game and Play beside the settings; upright or narrow (a half-folded foldable, a small window): the game on top
+            let wide = geometry.size.width > geometry.size.height && geometry.size.width >= 560
+            if wide {
+                HStack(spacing: 0) {
+                    VStack(spacing: 14) { header(icon: 88) }
+                        .padding(16)
+                        .frame(width: min(260, geometry.size.width * 0.3), height: geometry.size.height)
+                    settings
                 }
-                .padding(16)
-                .frame(width: geometry.size.width / 3, height: geometry.size.height)
-                List {
-                    ForEach(m.sections, id: \.self) { section in
-                        let rows = m.rows(in: section)
-                        if !rows.isEmpty {
-                            Section(section) {
-                                ForEach(rows) { SettingRow(s: $0, m: m) }
-                            }
-                        }
-                    }
-                    Section {
-                        Button("Reset to tested defaults") { m.reset() }
-                            .disabled(!m.changed)
-                    } footer: {
-                        Text("Brings back all settings this game was tested with.")
-                    }
-                    GameDataSection()
-                    GameDataServerSection()
-                    CloudSavesSection()
-                    Section {
-                        HStack {
-                            Text("Memory available")
-                            Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
-                        }
-                    }
+            } else {
+                VStack(spacing: 0) {
+                    HStack(spacing: 14) { header(icon: 56) }.padding(.horizontal, 16).padding(.vertical, 10)
+                    settings
                 }
-                .listStyle(.insetGrouped)
-                .contentMargins(.horizontal, 12, for: .scrollContent)
-                .frame(width: geometry.size.width * 2 / 3)
             }
         }
         .preferredColorScheme(.dark)
@@ -207,6 +181,60 @@ private struct LauncherView: View {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+    }
+
+    @ViewBuilder private func header(icon size: CGFloat) -> some View {
+        if let icon = appIcon() {
+            Image(uiImage: icon).resizable().frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.23))
+                .accessibilityHidden(true)
+        }
+        VStack(spacing: 4) {
+            Text((info("CFBundleDisplayName") as? String) ?? "Game")
+                .font(.title3.weight(.bold)).multilineTextAlignment(.center)
+                .lineLimit(3).minimumScaleFactor(0.7)
+            Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        playButton
+    }
+
+    // The settings most players change first (the list's level=basic rows), then the game data and saves; everything else under Advanced settings, closed
+    private var settings: some View {
+        List {
+            ForEach(m.sections(basic: true), id: \.self) { section in
+                let rows = m.rows(in: section, basic: true)
+                if !rows.isEmpty { Section(section) { ForEach(rows) { SettingRow(s: $0, m: m) } } }
+            }
+            GameDataServerSection()
+            GameDataSection()
+            CloudSavesSection()
+            Section {
+                DisclosureGroup("Advanced settings", isExpanded: $showAdvanced) {
+                    ForEach(m.sections, id: \.self) { section in
+                        let rows = m.rows(in: section, basic: false)
+                        if !rows.isEmpty {
+                            Text(section).font(.footnote.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 6)
+                            ForEach(rows) { SettingRow(s: $0, m: m) }
+                        }
+                    }
+                    HStack {
+                        Text("Memory available")
+                        Spacer()
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Section {
+                Button("Reset to tested defaults") { m.reset() }
+                    .disabled(!m.changed)
+            } footer: {
+                Text("Brings back all settings this game was tested with.")
+            }
+        }
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(.compact)
+        .contentMargins(.horizontal, 12, for: .scrollContent)
     }
 
     @ViewBuilder var playButton: some View {
