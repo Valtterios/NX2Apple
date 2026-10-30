@@ -63,14 +63,18 @@ private extension Range where Bound == Int64 { var len: Int64 { upperBound - low
 
 final class GameDataSync: @unchecked Sendable {
     static let chunkParallel = 6
-    let server: URL           // e.g. https://games.example.com/data — the manifests are at <server>/<title ID>/[<build>/]manifest.json
+    let servers: [URL]        // e.g. a home address first, then https://games.example.com/data; the manifests are at <server>/<title ID>/[<build>/]manifest.json
+    private(set) var using: URL?   // the address that answered: the files come from it too (their URLs are relative to its manifest)
     let token: String
     let gameDir: URL
     let progress = GameDataProgress()
-    private let session: URLSession
+    private let session: URLSession, probe: URLSession
 
-    init(server: URL, token: String, gameDir: URL) {
-        self.server = server; self.token = token; self.gameDir = gameDir
+    init(servers: [URL], token: String, gameDir: URL) {
+        self.servers = servers; self.token = token; self.gameDir = gameDir
+        let q = URLSessionConfiguration.ephemeral   // asking an address that is not reachable from here (the home one, away from home) gives up fast
+        q.timeoutIntervalForRequest = 4; q.waitsForConnectivity = false
+        probe = URLSession(configuration: q)
         let c = URLSessionConfiguration.default
         c.requestCachePolicy = .reloadIgnoringLocalCacheData; c.urlCache = nil
         c.httpMaximumConnectionsPerHost = Self.chunkParallel
@@ -87,20 +91,25 @@ final class GameDataSync: @unchecked Sendable {
         return r
     }
 
-    /// This build's manifest: <server>/<title>/<build>/manifest.json (exactly the version the app needs), else the latest one at <server>/<title>/manifest.json.
+    /// This build's manifest: <server>/<title>/<build>/manifest.json (exactly the version the app needs), else the latest one at <server>/<title>/manifest.json,
+    /// from the first address that answers (a home or Tailscale address before the public one): the download then runs from that address.
     func manifest(title: String, build: String?) async throws -> (GameDataManifest, URL) {
-        var urls: [URL] = []
-        let base = server.appendingPathComponent(title)
-        if let b = build, !b.isEmpty { urls.append(base.appendingPathComponent(b).appendingPathComponent("manifest.json")) }
-        urls.append(base.appendingPathComponent("manifest.json"))
-        var last = "no manifest"
-        for u in urls {
-            let (data, resp) = try await session.data(for: request(u))
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if code == 401 || code == 403 { throw GameDataError.server("The server refused access (HTTP \(code)): check the access token.") }
-            guard code == 200 else { last = "HTTP \(code) for \(u.absoluteString)"; continue }
-            do { return (try JSONDecoder().decode(GameDataManifest.self, from: data), u) }
-            catch { throw GameDataError.server("The manifest at \(u.absoluteString) cannot be read: \(error.localizedDescription)") }
+        var last = "no address"
+        for server in servers {
+            var urls: [URL] = []
+            let base = server.appendingPathComponent(title)
+            if let b = build, !b.isEmpty { urls.append(base.appendingPathComponent(b).appendingPathComponent("manifest.json")) }
+            urls.append(base.appendingPathComponent("manifest.json"))
+            for u in urls {
+                let data: Data, resp: URLResponse
+                do { (data, resp) = try await probe.data(for: request(u)) }
+                catch { last = "\(server.host ?? server.absoluteString): \(error.localizedDescription)"; fputs("game data: \(last); trying the next address\n", stderr); break }
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code == 401 || code == 403 { throw GameDataError.server("The server refused access (HTTP \(code)) at \(server.host ?? ""): check the access token.") }
+                guard code == 200 else { last = "HTTP \(code) for \(u.absoluteString)"; continue }
+                do { let m = try JSONDecoder().decode(GameDataManifest.self, from: data); using = server; fputs("game data: using \(server.absoluteString)\n", stderr); return (m, u) }
+                catch { throw GameDataError.server("The manifest at \(u.absoluteString) cannot be read: \(error.localizedDescription)") }
+            }
         }
         throw GameDataError.server("No game data for \(title) on the server (\(last)).")
     }

@@ -53,13 +53,15 @@ final class GameDataModel: ObservableObject {
 
     func start() {
         guard !running else { return }
-        guard let url = URL(string: server.trimmingCharacters(in: .whitespaces)), url.scheme == "https" || url.scheme == "http" else { note = "Enter the server address, e.g. https://games.example.com/data"; return }
+        // Several addresses, separated by spaces or commas: the first that answers is used (a home or Tailscale address first is fast at home, the public one works anywhere)
+        let urls = server.split(whereSeparator: { $0 == " " || $0 == "," || $0 == "\n" }).compactMap { URL(string: String($0)) }.filter { $0.scheme == "https" || $0.scheme == "http" }
+        guard !urls.isEmpty else { note = "Enter the server address, e.g. https://games.example.com/data"; return }
         running = true; note = ""; confirmDelete = false
         UIApplication.shared.isIdleTimerDisabled = true
-        let sync = GameDataSync(server: url, token: token.trimmingCharacters(in: .whitespaces), gameDir: gameDir)
+        let sync = GameDataSync(servers: urls, token: token.trimmingCharacters(in: .whitespaces), gameDir: gameDir)
         let want = expected
         task = Task { [weak self] in
-            let ticker = Task { [weak self] in await self?.tick(sync.progress) }
+            let ticker = Task { [weak self] in await self?.tick(sync.progress, sync) }
             defer { ticker.cancel() }
             do {
                 let (m, base) = try await sync.manifest(title: dm_game_title(), build: want.flatMap { romfsIdentityField($0, "build") })
@@ -72,7 +74,7 @@ final class GameDataModel: ObservableObject {
                     try await sync.syncFile(s, base: base, name: "msl.tar")
                 }
                 try await sync.syncFile(m.romfs, base: base, name: "romfs.img") { dm_romfs_status($0.path) == 0 }
-                self?.finish("Done: \(m.name ?? "game data") \(m.version) is ready. Press Play.")
+                self?.finish("Done: \(m.name ?? "game data") \(m.version) is ready (from \(sync.using?.host ?? "the server")). Press Play.")
             } catch is CancellationError {
                 self?.finish("Paused. Download resumes where it stopped.")
             } catch {
@@ -89,7 +91,7 @@ final class GameDataModel: ObservableObject {
         refresh(); note = msg
     }
 
-    private func tick(_ p: GameDataProgress) async {
+    private func tick(_ p: GameDataProgress, _ sync: GameDataSync) async {
         var last = p.fetched, lastT = Date(), speed = 0.0
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -99,7 +101,7 @@ final class GameDataModel: ObservableObject {
             let total = max(p.total, 1), done = p.done
             fraction = min(Double(done) / Double(total), 1)
             let gb = { (b: Int64) in String(format: "%.1f", Double(b) / 1e9) }
-            var s = "\(p.phase): \(gb(done)) / \(gb(total)) GB"
+            var s = "\(p.phase): \(gb(done)) / \(gb(total)) GB" + (sync.using?.host.map { " via \($0)" } ?? "")
             if speed > 1e5 {
                 s += String(format: " · %.0f MB/s", speed / 1e6)
                 let left = Double(total - done) / speed
@@ -113,7 +115,7 @@ final class GameDataModel: ObservableObject {
         guard confirmDelete else { confirmDelete = true; return }
         confirmDelete = false
         do {
-            try GameDataSync(server: URL(fileURLWithPath: "/"), token: "", gameDir: gameDir).deleteGameData()
+            try GameDataSync(servers: [], token: "", gameDir: gameDir).deleteGameData()
             refresh(); note = "Game data deleted. Your saves are kept."
         } catch { note = "Could not delete: \(error.localizedDescription)" }
     }
@@ -124,7 +126,7 @@ struct GameDataServerSection: View {
 
     var body: some View {
         Section {
-            TextField("Server, e.g. https://games.example.com/data", text: $m.server)
+            TextField("Server address(es): home first, then public, separated by spaces", text: $m.server, axis: .vertical)
                 .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled().disabled(m.running)
             SecureField("Access token (if the server asks for one)", text: $m.token).disabled(m.running)
             Text(m.status).foregroundStyle(.secondary)
