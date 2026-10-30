@@ -34,7 +34,8 @@ final class GameDataModel: ObservableObject {
     /// The download folder as the Files app shows it: inside LiveContainer, below its Data/Application/<app folder>/
     var whereShown: String {
         let p = gameDir.path
-        if let r = p.range(of: "/Data/Application/", options: .backwards) {   // the last one: LiveContainer's own folder is a Data/Application/<id> too return "LiveContainer › Data › Application › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
+        // The last one: LiveContainer's own folder is a Data/Application/<id> too
+        if let r = p.range(of: "/Data/Application/", options: .backwards) { return "LiveContainer › Data › Application › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
         if let r = p.range(of: "/Documents/") { return "On My iPhone › \((info("CFBundleDisplayName") as? String) ?? "the game") › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
         return p
     }
