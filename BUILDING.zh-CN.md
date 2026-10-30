@@ -12,7 +12,7 @@ git clone https://github.com/<you>/NX2Apple.git
 cd NX2Apple
 brew bundle --file=Brewfile                       # xcodegen, zstd, spirv-cross, glslang（打包脚本会检查它）, .NET SDK
 python3 -m venv .venv                             # Homebrew 的 Python 不允许全局 pip 安装（PEP 668）
-.venv/bin/python -m pip install lz4 capstone fonttools nsz "backports.zstd; python_version < '3.14'"
+.venv/bin/python -m pip install lz4 capstone fonttools zbic nsz "backports.zstd; python_version < '3.14'"
 source .venv/bin/activate                         # 之后的 python3 即 venv 的（每个新终端都要执行）
 ```
 
@@ -68,4 +68,4 @@ GAME=<title id> W=<工作目录> PATCHED=<改写目录> \
 
 `--full-romfs`（或 `DM_FULL_ROMFS=1`）把 RomFS 打进包里——上游行为，只对小体量游戏有意义。
 
-RomFS 不再需要先打成分片归档：构建会把游戏数据写成一个 `romfs.img`。更早做好的归档（`romfs.idx` 加 `romfs.00`、`romfs.01`……）仍然能加载，因为补丁队列还带着它的读取层（[patches/0002-romfsarc.patch](patches/0002-romfsarc.patch)，格式见 [docs/ROMFS_ARCHIVE.md](docs/ROMFS_ARCHIVE.md)）。
+RomFS 不再需要先打成分片归档：构建会把游戏数据写成一个 `romfs.img`。更早做好的分片归档（`romfs.idx` 加 `romfs.00`、`romfs.01`……）不再被读取；启动器会把这样的文件夹视为没有游戏数据，需要再发送一次 `romfs.img`。

@@ -42,6 +42,7 @@ struct ContentView: View {
     @State private var freeSpaceFor: UUID?   // the game whose Free space sheet is open
     @State private var controlsOpen = false
     @State private var savesFor: UUID?   // the game whose Saves sheet is open (SaveTransfer.swift)
+    @State private var cheatsFor: UUID?  // the game whose Cheats sheet is open (CheatsView.swift)
     @State private var manageOpenFor: UUID?   // the game whose Manage menu is open (ManageMenu.swift)
     @StateObject private var controls: ControlLayout
     @StateObject private var gamepad = LauncherGamepad()
@@ -155,7 +156,7 @@ struct ContentView: View {
         .onAppear {
             gamepad.perform = padAction
             gamepad.capture = { [consoleDriver] id, action in consoleDriver.consumePress(controllerID: id, isBack: action == .b) }
-            if performStartupChecks { library.migrateLaunchOptions() }
+            if performStartupChecks { library.migrateLaunchOptions(); CloudSavesMigration.run() }
             if qaManage.open {
                 if qaManage.ring { padFocus.show(default: nil) }
                 manageOpenFor = library.selected?.id
@@ -235,6 +236,7 @@ struct ContentView: View {
             if let id = savesFor { SavesView(m: m, library: library, gameID: id).environmentObject(padFocus) }
         }
         .onChange(of: savesFor) { id in padFocus.scope = id != nil ? "saves" : currentPadScope }
+        .cheatsSheet(for: $cheatsFor, m: m, library: library, pad: padFocus) { currentPadScope }
         .onChange(of: optionsFor) { id in padFocus.scope = id != nil ? "launch" : (controlsOpen ? "controls" : "main") }
         .onChange(of: controlsOpen) { open in padFocus.scope = open ? "controls" : (optionsFor != nil ? "launch" : "main") }
         .onChange(of: page) { _ in padFocus.focused = nil }
@@ -689,7 +691,9 @@ struct ContentView: View {
             m.slots[index].paths = game.inputs[m.slots[index].id] ?? []
             m.slots[index].problem = ""
         }
-        m.gameDir = (m.basePath as NSString).deletingLastPathComponent
+        // The folder the game's files were found in (a base package may sit one level down in its own folder) — from the
+        // scan, or from the last build. Falling back to the base's folder would put the update and DLC out of reach.
+        m.gameDir = game.sourceFolder.isEmpty ? (m.basePath as NSString).deletingLastPathComponent : game.sourceFolder
         m.outDir = game.outputDirectory
         m.done = false; m.doneNote = ""; m.stages = []
         m.target = game.lastTarget
@@ -716,7 +720,7 @@ struct ContentView: View {
             }
             return
         }
-        let sheetOpen = controllerSheet || optionsFor != nil || controlsOpen || savesFor != nil || freeSpaceFor != nil
+        let sheetOpen = controllerSheet || optionsFor != nil || controlsOpen || savesFor != nil || cheatsFor != nil || freeSpaceFor != nil
         switch ManagePad.route(action, menuOpen: manageOpenFor != nil, sheetOpen: sheetOpen, hasGame: library.selected != nil && page == .library) {
         case .close: manageOpenFor = nil; return
         case .swallow: return
@@ -729,6 +733,7 @@ struct ContentView: View {
         }
         if action == .b, controllerSheet { controllerSheet = false; return }
         if action == .b, savesFor != nil { savesFor = nil; return }
+        if action == .b, cheatsFor != nil { cheatsFor = nil; return }
         // The Free space sheet: B closes it, the D-pad and A work in it, X, L and R do nothing behind it
         if freeSpaceFor != nil && [.b, .x, .l, .r].contains(action) { if action == .b { freeSpaceFor = nil }; return }
         if action == .b {
@@ -767,7 +772,7 @@ struct ContentView: View {
                         hasBuildFolder: BuildFolder.location(for: game) != nil,
                         hasLog: GameLog.latest(titleID: game.titleID, appPath: game.appPath) != nil,
                         actions: ManageActions(
-                            rebuild: { configureBuild(game) }, options: { optionsFor = game.id }, saves: { savesFor = game.id },
+                            rebuild: { configureBuild(game) }, options: { optionsFor = game.id }, saves: { savesFor = game.id }, cheats: { cheatsFor = game.id },
                             changeArtwork: { chooseArtwork(game) }, resetArtwork: { library.setArtwork("", for: game.id) },
                             reveal: { if let path = game.revealTarget { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) } },
                             showLog: { if let log = GameLog.latest(titleID: game.titleID, appPath: game.appPath) { GameLog.show(log) } },
@@ -778,7 +783,7 @@ struct ContentView: View {
 
     /// The scope a controller acts in when no menu is open: the innermost sheet, else the window.
     private var currentPadScope: String {
-        controllerSheet ? "console.controllers" : savesFor != nil ? "saves" : freeSpaceFor != nil ? "free" : optionsFor != nil ? "launch" : controlsOpen ? "controls" : "main"
+        controllerSheet ? "console.controllers" : savesFor != nil ? "saves" : cheatsFor != nil ? "cheats" : freeSpaceFor != nil ? "free" : optionsFor != nil ? "launch" : controlsOpen ? "controls" : "main"
     }
 
     /// The space the collection row keeps around its cards for the focus ring (PadFocus draws it 4 pt outside a target).
@@ -802,11 +807,16 @@ struct ContentView: View {
             // The keyboard and controller layout (Settings → Controls) goes to every game; a build whose host does not read it plays with the default keys.
             // They stay launch overrides (the environment) for now: DM_KEYMAP and DM_PAD_MAP become saved choices only when seedds/nxnative#386 merges.
             let environment = GameStart.environment(for: game, library: library, controls: controls, repo: m.repoPath, labels: m.t)   // GameStart.swift: the console mode starts games with the same
-            if !environment.isEmpty { configuration.environment = environment }
-            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: game.appPath), configuration: configuration) { _, error in
+            let withRecording = environment.merging(FrameTimes.recordingEnvironment(for: game, library: library.folder)) { $1 }   // FrameTimes.swift, as console mode does
+            if !withRecording.isEmpty { configuration.environment = withRecording }
+            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: game.appPath), configuration: configuration) { app, error in
+                let pid = app?.processIdentifier
                 DispatchQueue.main.async {
-                    launching = false
-                    if let error { launchError = error.localizedDescription }
+                    MainActor.assumeIsolated {
+                        launching = false
+                        if let error { launchError = error.localizedDescription }
+                        else if let pid { GameReturnWatcher.shared.didStart(pid: pid) }   // ReturnAfterPlay.swift
+                    }
                 }
             }
         } catch { launchError = error.localizedDescription }

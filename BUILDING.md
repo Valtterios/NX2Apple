@@ -11,7 +11,7 @@ git clone https://github.com/<you>/NX2Apple.git
 cd NX2Apple
 brew bundle --file=Brewfile                       # xcodegen, zstd, spirv-cross, glslang (the NSP script checks for it), .NET SDK
 python3 -m venv .venv                             # Homebrew's Python refuses global pip installs (PEP 668)
-.venv/bin/python -m pip install lz4 capstone fonttools nsz "backports.zstd; python_version < '3.14'"
+.venv/bin/python -m pip install lz4 capstone fonttools zbic nsz "backports.zstd; python_version < '3.14'"
 source .venv/bin/activate                         # so that python3 below is the venv's (in each new terminal)
 ```
 
@@ -71,4 +71,4 @@ GAME=<title id> W=<work dir> PATCHED=<patched dir> \
 `--full-romfs` (or `DM_FULL_ROMFS=1`) packs the RomFS into the package instead — upstream's
 behaviour, only sensible for small games.
 
-The RomFS no longer has to be packed into a shard archive: the build writes the game's data as a single `romfs.img`. Archives made earlier (`romfs.idx` with `romfs.00`, `romfs.01`, …) still load, because the patch queue still carries the reader ([patches/0002-romfsarc.patch](patches/0002-romfsarc.patch), format in [docs/ROMFS_ARCHIVE.md](docs/ROMFS_ARCHIVE.md)).
+The RomFS no longer has to be packed into a shard archive: the build writes the game's data as a single `romfs.img`. Shard archives made earlier (`romfs.idx` with `romfs.00`, `romfs.01`, …) are no longer read; the launcher reports such a folder as having no game data, and the data is sent again once as a `romfs.img`.

@@ -6,15 +6,18 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from PySide6.QtCore import Q_ARG, QMetaObject, QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QSettings, Q_ARG, QMetaObject, QObject, Qt, QThread, Signal, Slot
 
+from . import build_failure as bf
+from . import input_staging
+from . import inputs
 from . import platform_util as pu
 from .i18n import Lang
 from .localization import t
@@ -39,6 +42,10 @@ class Dep:
     installing: bool = False
     required: bool = True       # a missing optional row (spirv-cross for Metal games, glslangValidator)
                                 # is not part of "缺 N 项": it does not stop the build in front of you
+    pick_key: str = ''          # a manual row the user can point at a folder ('ios_sdk', 'metal_dir'):
+                                # the panel grows a Choose button; the pick is validated and remembered
+    fix_hint: str = ''          # an L10n key set when this row's install failed: what to do next
+    last_error: str = ''        # the tool's own last error line, shown under the row (Mac parity)
 
     @property
     def ok(self) -> bool:
@@ -72,8 +79,13 @@ class Model(QObject):
     finished = Signal(bool, str)          # ok, note
     appUpdateFound = Signal(str, str)     # tag, url
 
+    #: Set by the window: asks for a folder (QFileDialog lives in the UI layer) and returns the
+    #: path, or '' when the user cancelled. `pick_dep_folder` calls it, so the model stays UI-free.
+    ask_folder: Callable[[str], str] | None = None
+
     def __init__(self) -> None:
         super().__init__()
+        self.settings = QSettings('NS Port Builder', 'NSPortBuilder')
         self.lang = Lang.initial()
         self.repo_path = self._find_repo()
         self.python_path, self.python_ok, self.python_ver = pu.find_python()
@@ -83,6 +95,8 @@ class Model(QObject):
         self.stages: list[Stage] = []
         self.running = False
         self.log_tail = ''
+        self.failure: bf.Failure | None = None   # the script's known early stop (build_failure.py), None for any other
+        self.override = bf.OverrideState()      # "Build anyway": one confirmed --allow-* for the next build
         self._last_error = ''   # the last real log line: the failure note names it (issue #52)
         self.game_dir = ''
         self.base_path = ''
@@ -122,6 +136,13 @@ class Model(QObject):
 
     def t(self, key: str, *args: object) -> str:
         return t(key, self.lang, *args)
+
+    def settings_value(self, key: str, default: bool | None = None) -> bool | None:
+        v = self.settings.value(key, defaultValue='', type=str)
+        return default if v == '' else v.lower() == 'true'
+
+    def settings_set(self, key: str, value: bool) -> None:
+        self.settings.setValue(key, 'true' if value else 'false')
 
     def toggle_lang(self) -> None:
         self.lang = self.lang.other
@@ -202,11 +223,11 @@ class Model(QObject):
         """
         if py_ok:
             return Dep('python', 'dep.python', 'dep.python.hint', DepState.OK, py)
-        if py_ver and pu._ver_tuple(py_ver) >= (3, 9):
+        if py_ver and pu._ver_tuple(py_ver) >= pu.MIN_PYTHON:
             return Dep('python', 'dep.python', 'dep.python.hint', DepState.MISSING,
                        f'dep.python.missing:{py} ({py_ver})',
                        install=[py, '-m', 'pip', 'install', 'lz4', 'capstone', 'fonttools',
-                                'backports.zstd', 'nsz'])
+                                'zbic', 'backports.zstd', 'nsz'])
         if pu.IS_WIN:
             return Dep('python', 'dep.python', 'dep.python.hint', DepState.MISSING,
                        f'dep.python.none:{py or "python3"}',
@@ -270,6 +291,13 @@ class Model(QObject):
         for d in deps:
             if d.id in running:
                 d.installing = True
+        # The failure note belongs to the row, and a check (which rebuilds every row) must not
+        # wipe it: it clears when that row installs successfully instead.
+        previous = {d.id: d for d in self.deps}
+        for d in deps:
+            p = previous.get(d.id)
+            if p is not None and not d.ok:
+                d.last_error, d.fix_hint = p.last_error, p.fix_hint
 
         self.deps = deps
         if not pu.IS_WIN:
@@ -359,7 +387,10 @@ class Model(QObject):
             out.append(Dep('lld', 'dep.lld', 'dep.lld.hint', state(p),
                            p.detail if not p.ok else (p.path or 'ok')))
 
-        # the SDK
+        # the SDK. Apple's SDK cannot be redistributed by us; the in-app download (the
+        # xybp888/iOS-SDKs checkout) needs no Apple ID and is the default fix, and Choose lets a
+        # user with Apple's own SDK point at it instead — validated and written to
+        # toolchain.json, so the choice survives restarts.
         p = by_id.get('ios_sdk')
         if p:
             detail = ''
@@ -369,7 +400,7 @@ class Model(QObject):
                 detail = p.detail
             install = [] if p.ok else ['__win__:ios_sdk']
             out.append(Dep('ios_sdk', 'dep.iossdk', 'dep.iossdk.hint', state(p), detail,
-                           install=install))
+                           install=install, pick_key='' if p.ok else 'ios_sdk'))
 
         # Metal. The hint is the Windows one: on macOS this row says
         # `xcodebuild -downloadComponent`, which is an Apple ID login away on Windows
@@ -377,7 +408,8 @@ class Model(QObject):
         p = by_id.get('metal')
         if p:
             out.append(Dep('metal', 'dep.metal', 'dep.metal.hint.win', state(p),
-                           (p.path or 'ok') if p.ok else (p.detail or '')))
+                           (p.path or 'ok') if p.ok else (p.detail or ''),
+                           pick_key='' if p.ok else 'metal_dir'))
 
         # the probes: one row each, so a broken toolchain names the step that fails
         for pid, key in (('probe_compile', 'dep.probe.compile'),
@@ -722,13 +754,71 @@ class Model(QObject):
                 # DownloadError, OSError, ImportError, a missing attribute: all reported with the
                 # type so a bug report names the failure without guessing.
                 import traceback
-                self.log(self.t('dep.install.fail', f'{type(e).__name__}: {e}') + '\n')
+                detail = f'{type(e).__name__}: {e}'
+                self.log(self.t('dep.install.fail', detail) + '\n')
                 self.log(traceback.format_exc() + '\n')
+                self._record_install_failure(dep, detail)
             self._clear_installing(dep)
             self.depsChanged.emit()
             self.check_deps()
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _record_install_failure(self, dep: Dep, detail: str) -> None:
+        """Say why an install failed and what to do, under the row itself (Mac parity).
+
+        The log already carries the traceback; the row gets the one-line error plus a fix chosen
+        from it — network for downloads, disk space for unpacks — so the player needs no log
+        reading for the two cases that cover most of them.
+        """
+        fix = self._classify_install_failure(detail)
+        for r in self.deps:
+            if r.id == dep.id:
+                r.last_error = detail
+                r.fix_hint = fix
+
+    @staticmethod
+    def _classify_install_failure(detail: str) -> str:
+        """The fix hint for one install failure, from its text (network, disk space, else the log)."""
+        low = detail.lower()
+        if 'timed out' in low or 'connection' in low or 'resolve host' in low or 'network' in low:
+            return 'dep.fix.network'
+        if 'no space' in low or 'disk full' in low or 'errno 28' in low:
+            return 'dep.fix.diskspace'
+        return 'dep.fix.log'
+
+    def pick_dep_folder(self, dep: Dep) -> None:
+        """A folder the user chose for one manual row: validated now, remembered in
+        `toolchain.json`, then a fresh check re-reads it.
+
+        Validation before saving keeps a wrong pick from silently becoming the configured answer
+        (the SDK probe would then say `wrong` with a confusing version note on every start).
+        """
+        if not dep.pick_key:
+            return
+        from .win import toolchain as wtc
+        ask = self.ask_folder
+        if ask is None:
+            return   # no window attached (tests): nothing to ask with
+        folder = ask(self.t('dep.pick.' + dep.pick_key + '.title'))
+        if not folder:
+            return
+        if dep.pick_key == 'ios_sdk':
+            # The SDK can sit one level down (the guide's step 2 says so): accept both layouts.
+            candidates = [Path(folder)] + sorted(Path(folder).glob('iPhoneOS*.sdk'), reverse=True)
+            match = next((c for c in candidates if wtc.is_sdk_dir(c)), None)
+            if match is None:
+                self.log(self.t('dep.pick.iossdk.invalid', folder) + '\n')
+                return
+            ver, _build = wtc.sdk_version(match)
+            wtc.save_config('ios_sdk', str(match))
+            self.log(self.t('dep.pick.iossdk.saved', match) + '\n')
+            if ver:
+                self.log(self.t('dep.pick.iossdk.version', ver) + '\n')
+        else:
+            wtc.save_config(dep.pick_key, folder)
+            self.log(self.t('dep.pick.saved', folder) + '\n')
+        self.check_deps()
 
     def _progress_logger(self, label: str):
         """A progress callback that logs at 5% steps, not on every chunk.
@@ -753,7 +843,33 @@ class Model(QObject):
     def _make_venv(self, base: str) -> bool:
         """Create or reuse the app's venv and install the build packages into it."""
         vpy = pu.venv_python()
+        if Path(vpy).is_file():
+            ver = pu._python_version(vpy)
+            if not ver or pu._ver_tuple(ver) < pu.MIN_PYTHON:
+                # A venv an older app made from Apple's 3.9 (issue #75): pip into it would
+                # "succeed" and the build would still fail. Moved aside, never deleted, because
+                # the folder is the user's. Only when a base can build a new one.
+                new_base = pu.venv_base(base)
+                if new_base is None or new_base == vpy:
+                    self.log(f'{pu.venv_dir()} is older than Python {pu.MIN_PYTHON[0]}.'
+                             f'{pu.MIN_PYTHON[1]} and no newer Python was found to rebuild it from\n')
+                    return False
+                vdir = pu.venv_dir()
+                aside = vdir.with_name(f'{vdir.name}.old-{time.strftime("%Y%m%d-%H%M%S")}')
+                try:
+                    vdir.rename(aside)
+                except OSError as e:
+                    self.log(f'could not move {vdir} aside: {e}\n')
+                    return False
+                self.log(f'moved the old venv to {aside}\n')
         if not Path(vpy).is_file():
+            # The panel's last resort is /usr/bin/python3 (3.9) or the venv path itself, and
+            # neither can run `-m venv`: the row used to stay red however often Install ran.
+            base = pu.venv_base(base)
+            if base is None:
+                self.log(f'no Python {pu.MIN_PYTHON[0]}.{pu.MIN_PYTHON[1]} or newer to create '
+                         f'{pu.venv_dir()} from\n')
+                return False
             vdir = pu.venv_dir()
             vdir.parent.mkdir(parents=True, exist_ok=True)
             self.log(f'$ {base} -m venv {vdir}\n')
@@ -761,9 +877,9 @@ class Model(QObject):
                 self.log('venv creation failed\n')
                 return False
         ver = pu._ver_tuple(pu._python_version(vpy))
-        pkgs = ['lz4', 'capstone', 'fonttools', 'nsz']
+        pkgs = ['lz4', 'capstone', 'fonttools', 'zbic', 'nsz']
         if ver < (3, 14):
-            pkgs.insert(3, 'backports.zstd')
+            pkgs.insert(4, 'backports.zstd')
         self.log(f'$ {vpy} -m pip install {" ".join(pkgs)}\n')
         try:
             p = subprocess.Popen([vpy, '-m', 'pip', 'install'] + pkgs, stdout=subprocess.PIPE,
@@ -879,13 +995,10 @@ class Model(QObject):
             elif p.is_dir():
                 files += [q for q in sorted(p.iterdir()) if q.is_file()]
         self.keys_path = next((str(f) for f in files if f.name.lower() == 'prod.keys'), self.keys_path)
-        nsps = [f for f in files if f.suffix.lower() in ('.nsp', '.xci', '.nsz', '.xcz')]
-        updates = [f for f in nsps if '[upd]' in f.name.lower() or 'update' in f.name.lower()]
-        dlcs = [f for f in nsps if '[dlc]' in f.name.lower() or 'addon' in f.name.lower()]
-        bases = [f for f in nsps if f not in updates and f not in dlcs]
-        self.base_path = str(bases[0]) if bases else ''
-        self.update_path = str(updates[0]) if updates else ''
-        self.dlc_paths = [str(f) for f in dlcs]
+        found = inputs.classify(files)
+        self.base_path = str(found['base']) if found['base'] else ''
+        self.update_path = str(found['update']) if found['update'] else ''
+        self.dlc_paths = [str(f) for f in found['dlc']]
         self.repoChanged.emit()
 
     @property
@@ -906,33 +1019,19 @@ class Model(QObject):
         all_files = [self.base_path, self.update_path] + self.dlc_paths
         dirs = {str(Path(f).parent) for f in all_files if f}
 
-        staging: str | None = None
-        input_dir = base_dir
-        if len(dirs) > 1:
-            # files from different folders: a staging folder of links so the script sees one folder
-            staging = tempfile.mkdtemp(prefix='nspb-stage-')
-            linked = 0
-            for f in all_files:
-                if not f:
-                    continue
-                dst = Path(staging, Path(f).name)
-                try:
-                    os.link(f, dst) if not pu.IS_WIN else shutil.copy2(f, dst)
-                    linked += 1
-                except OSError:
-                    try:
-                        shutil.copy2(f, dst)
-                        linked += 1
-                    except OSError:
-                        pass
-            if linked == 0:
-                self.finished.emit(False, self.t('msg.stagingFailed'))
-                return
-            input_dir = staging
-
         tid = self._title_id(self.base_path)
         tid_hex = f'{tid:016X}' if tid else 'game'
         work_dir = str(Path(self.out_dir or base_dir, f'{tid_hex}_build'))
+
+        input_dir = base_dir
+        if len(dirs) > 1:
+            # files from different folders: a stable folder of links per game, so the script sees one
+            # folder and its fingerprints match on the next build (#132)
+            staging = input_staging.folder(work_dir)
+            if input_staging.sync(all_files, staging, hard_links=not pu.IS_WIN) == 0:
+                self.finished.emit(False, self.t('msg.stagingFailed'))
+                return
+            input_dir = staging
 
         compressed = any(Path(f).suffix.lower() in ('.nsz', '.xcz')
                          for f in all_files if f)
@@ -969,6 +1068,8 @@ class Model(QObject):
             self.ipa_path = str(Path(self.out_dir, f'{tid_hex}.ipa'))
             args += ['-o', self.ipa_path]
         self.effective_work_dir = work_dir if has_work_dir else str(Path(input_dir, f'{tid_hex}_build'))
+        flag = self.override.take()   # for this build only: the next one asks again
+        args = bf.arguments(args, flag)
 
         self.running = True
         self.runningChanged.emit(True)
@@ -976,7 +1077,11 @@ class Model(QObject):
         self.ipa_path = self.archive_path = self.mac_app_path = ''
         self.log_tail = ''
         self._last_error = ''
+        self.failure = None
+        self.override.cancel()
         self.stagesChanged.emit()
+        if flag:
+            self.log(self.t('fail.override.note', flag) + '\n')
         self.log(self.t('msg.running', py + ' ' + ' '.join(args)) + '\n')
 
         env = pu.child_env()
@@ -1030,12 +1135,61 @@ class Model(QObject):
                 # The last real line says more than the exit code: "Build failed (exit code 1)"
                 # on its own sent a reporter looking for a log that was not on screen (#52)
                 last = getattr(self, '_last_error', '')
-                self.finished.emit(False, self.t('msg.buildFailedReason', last) if last else self.t('msg.buildFailed'))
-            if staging:
-                shutil.rmtree(staging, ignore_errors=True)
+                note = self.t('msg.buildFailedReason', last) if last else self.t('msg.buildFailed')
+                known = bf.classify(self.log_tail, keys_readable=self._keys_readable())
+                if known.kind != bf.UNKNOWN:   # a known early stop: the window explains it and offers the next step
+                    self.failure = known
+                    note = self.failure_what(known)
+                self.finished.emit(False, note)
 
         self._thread = threading.Thread(target=work, daemon=True)
         self._thread.start()
+
+    def failure_what(self, f: 'bf.Failure') -> str:
+        """The first sentence of a failure's hint (it names the game of a 32-bit program when the message does)."""
+        if f.kind == bf.A32_PROGRAM and f.game:
+            return self.t('fail.a32Program.whatNamed', f.game)
+        if f.kind == bf.DISK_FULL and f.detail:
+            return self.t('fail.diskFull.whatNeeds', f.detail)
+        return self.t(f.what_key)
+
+    def _keys_readable(self) -> bool | None:
+        """Whether the chosen keys file can be opened: None when none is chosen."""
+        if not self.keys_path:
+            return None
+        try:
+            with open(self.keys_path, 'rb'):
+                return True
+        except OSError:
+            return False
+
+    def failure_folder(self, f: 'bf.Failure') -> str:
+        """The folder "Show folder" opens: the one with the game files, else the one the message names. For a full disk the
+        build folder (`<title ID>_build`) when it is there, since that is where the space went."""
+        game_dir = str(Path(self.base_path).parent) if self.base_path else ''
+        folder = game_dir or (f.detail if f.kind == bf.NO_TITLE_ID else '') or ''
+        if f.kind == bf.DISK_FULL and game_dir:
+            try:
+                built = sorted(p.name for p in Path(game_dir).iterdir() if p.name.endswith('_build') and p.is_dir())
+            except OSError:
+                built = []
+            if built:
+                folder = str(Path(game_dir, built[0]))
+        return folder
+
+    def fix_failure(self, f: 'bf.Failure') -> None:
+        """The failure card's fix buttons run the dependency rows' own fixes (install_dep, as Settings does)."""
+        if f.kind == bf.TRANSLATOR:
+            row = next((d for d in self.deps if d.id == 'dotnet'), None)
+            if row:
+                self.install_dep(row)
+        elif f.kind == bf.ZBIC:
+            # the python row's own fix (a venv with the packages, zbic among them): the row may read OK, so the command is built here
+            self.install_dep(Dep('python', 'dep.python', 'dep.python.hint', DepState.MISSING,
+                                 install=[self.python_path, '-m', 'pip', 'install', 'zbic']))
+        elif f.kind == bf.IOS_SDK and not pu.IS_WIN:
+            self.install_dep(Dep('xcode', 'dep.xcode', 'dep.xcode.hint', DepState.MISSING,
+                                 install=['/usr/bin/xcodebuild', '-downloadPlatform', 'iOS']))
 
     def cancel_build(self) -> None:
         if self._proc and self._proc.poll() is None:
@@ -1047,6 +1201,7 @@ class Model(QObject):
         """Feed one line of the build's output: stage lines move the stage list, everything
         else goes to the log (which is what the window shows)."""
         self.log(line + '\n')
+        self.log_tail = (self.log_tail + line + '\n')[-12000:]   # what the classifier reads on a failure
         # The last line that was not stage bookkeeping: a failed build's summary used to be the
         # bare exit code ("Build failed (exit code 1)"), which told the reporter nothing and sent
         # them looking for a log that a short window had below the fold (issue #52)
@@ -1123,13 +1278,5 @@ class Model(QObject):
 
     @staticmethod
     def _title_id(nsp: str) -> int | None:
-        """The title ID from a dump's file name: the 16 hex digits in [0100…], which every
-        dumper puts there."""
-        import re
-        m = re.search(r'\[([0-9A-Fa-f]{16})\]', Path(nsp).name)
-        if not m:
-            return None
-        try:
-            return int(m.group(1), 16)
-        except ValueError:
-            return None
+        """The title ID from a dump's file name: bracketed [0100…] or a bare 16-digit ID."""
+        return inputs.title_id(Path(nsp).name)

@@ -7,21 +7,20 @@ main.m locates the RomFS in the picked location, then Documents/games/<id>/, the
 temp follow it. Launcher.swift gets a Game data section; front_ios.m goes back to it when no data is found.
 
 Upstream-Status: pending
-Reason: Several games in one app, game data on an external drive: Documents/games/<id>/{romfs.img,romfs,msl,save,temp} and a Files-app pick of the data folder (needs the runtime profile). iOS twin of seedds/nxnative#460, which is Mac only
+Reason: Several games in one app, game data on an external drive: Documents/games/<id>/{romfs.img,romfs,msl,save,temp} and a Files-app pick of the data folder (needs the runtime profile). iOS twin of seedds/nxnative#460, which is Mac only. Also add-on content: games/<id>/aoc/<index>.img becomes DM_AOC_DIR (a slim IPA carries none, LNPANDY/NX2Apple#202), before <App>/aoc and never over an explicit value, compatible with the Documents/aoc of seedds/nxnative#486. Also DM_CHEATS=games/<id>/cheats (never over an explicit value), where the launcher's Cheats sheet copies a game's cheat files (LNPANDY/NX2Apple#97)
 Issue: LNPANDY/NX2Apple#123
 ---
- dm/ios/Sources/DataBookmark.h          |  32 ++++++++
- dm/ios/Sources/DataBookmark.m          |  79 ++++++++++++++++++
- dm/ios/Sources/DmIOS-Bridging-Header.h |   3 +
- dm/ios/Sources/Launcher.swift          |  88 ++++++++++++++++++++
+ dm/ios/Sources/DataBookmark.h          |  32 +++++++
+ dm/ios/Sources/DataBookmark.m          |  79 ++++++++++++++++
+ dm/ios/Sources/DmIOS-Bridging-Header.h |   8 +-
+ dm/ios/Sources/Launcher.swift          |  63 ++++++++++++-
  dm/ios/Sources/front_ios.m             |  13 ++-
- dm/ios/Sources/main.m                  | 109 +++++++++++++++++++++++--
- dm/ios/project.yml                     |   1 +
- dm/ios/tests/test_romfs_startup.py     |  41 +++++++++-
- 8 files changed, 354 insertions(+), 12 deletions(-)
+ dm/ios/Sources/main.m                  | 123 +++++++++++++++++++++++--
+ dm/ios/project.yml                     |   2 +-
+ dm/ios/tests/test_romfs_startup.py     |  49 +++++++++-
+ 8 files changed, 353 insertions(+), 16 deletions(-)
  create mode 100644 dm/ios/Sources/DataBookmark.h
  create mode 100644 dm/ios/Sources/DataBookmark.m
- create mode 100644 dm/ios/Sources/DmIOS-Bridging-Header.h
 
 diff --git a/dm/ios/Sources/DataBookmark.h b/dm/ios/Sources/DataBookmark.h
 new file mode 100644
@@ -147,21 +146,26 @@ index 00000000..3dcc3834
 +    [NSUserDefaults.standardUserDefaults removeObjectForKey:kPickedData];
 +}
 diff --git a/dm/ios/Sources/DmIOS-Bridging-Header.h b/dm/ios/Sources/DmIOS-Bridging-Header.h
-new file mode 100644
-index 00000000..92a2b3a5
---- /dev/null
+index 70789d30..710e59aa 100644
+--- a/dm/ios/Sources/DmIOS-Bridging-Header.h
 +++ b/dm/ios/Sources/DmIOS-Bridging-Header.h
-@@ -0,0 +1,3 @@
-+// What Swift sees of the app's Objective-C: the data bookmark the Files app hands out (see
-+// DataBookmark.h). project.yml points SWIFT_OBJC_BRIDGING_HEADER here.
+@@ -1,2 +1,8 @@
+-// The Objective-C functions Launcher.swift calls (CloudSaves.h). project.yml points SWIFT_OBJC_BRIDGING_HEADER here.
++// What Swift sees of the app's Objective-C: the cloud-save folder pick (see CloudSaves.h) and the data bookmark the Files app
++// hands out (see DataBookmark.h). project.yml points SWIFT_OBJC_BRIDGING_HEADER here.
+ #import "CloudSaves.h"
 +#import "DataBookmark.h"
++
++// main.m: set when the game data found is an old shard archive (romfs.idx), which is no longer read. The sentence names the
++// action (re-send the game data as romfs.img from the launcher), or NULL. The launcher's Game data section shows it.
++const char *dm_old_archive_message(void);
 diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
-index dc63e4e3..df41a708 100644
+index f2cb6c1f..44af3cc5 100644
 --- a/dm/ios/Sources/Launcher.swift
 +++ b/dm/ios/Sources/Launcher.swift
-@@ -8,6 +8,93 @@ import os
- 
+@@ -10,6 +10,64 @@ import os
  private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
+ 
  
 +/// Where this game's data comes from, and a picker to change it.
 +///
@@ -194,7 +198,7 @@ index dc63e4e3..df41a708 100644
 +                 : note)
 +        }
 +        .sheet(isPresented: $picking) {
-+            DocumentPicker { url in
++            DocumentPicker(types: [.item]) { url in
 +                picking = false
 +                if dm_store_picked_data(url) {
 +                    note = "Saved. The game uses this location when you press Play."
@@ -215,57 +219,45 @@ index dc63e4e3..df41a708 100644
 +        picked = dm_picked_data_path(&stale) ?? ""
 +        if stale.boolValue && picked.isEmpty {
 +            note = "The location you picked before is no longer readable (the app was signed differently). Please choose it again."
++        } else if note.isEmpty, let old = dm_old_archive_message() {
++            note = String(cString: old)
 +        }
 +    }
 +}
 +
-+/// UIDocumentPickerViewController for files and folders, in the two callbacks a SwiftUI sheet wants.
-+private struct DocumentPicker: UIViewControllerRepresentable {
-+    let onPick: (URL) -> Void
-+    let onCancel: () -> Void
-+
-+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-+        // .open (not .import): the file stays where it is and the bookmark keeps pointing at it,
-+        // which is the whole point — an import would copy 16 GB into the app's container.
-+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: false)
-+        picker.allowsMultipleSelection = false
-+        picker.delegate = context.coordinator
-+        return picker
-+    }
-+
-+    func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
-+
-+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
-+
-+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-+        let onPick: (URL) -> Void
-+        let onCancel: () -> Void
-+        init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
-+            self.onPick = onPick; self.onCancel = onCancel
-+        }
-+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-+            if let url = urls.first { onPick(url) } else { onCancel() }
-+        }
-+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onCancel() }
-+    }
-+}
-+
- private struct LauncherView: View {
-     @ObservedObject var m: LauncherModel
-     let play: () -> Void
-@@ -45,6 +132,7 @@ private struct LauncherView: View {
+ /// Cloud saves: an iCloud Drive folder shared with the Mac app (chosen in its settings window's
+ /// Cloud saves too). The host brings the save in from there when the game starts and
+ /// sends it there after each save (dm/host/save_sync.h); the folder is a bookmark (CloudSaves.m).
+@@ -60,14 +118,14 @@ private struct CloudSavesSection: View {
+     }
+ }
+ 
+-/// UIDocumentPickerViewController for a folder, in the two callbacks a SwiftUI sheet wants.
++/// UIDocumentPickerViewController for files or folders (`types`), in the two callbacks a SwiftUI sheet wants.
+ private struct DocumentPicker: UIViewControllerRepresentable {
+     var types: [UTType] = [.folder]
+     let onPick: (URL) -> Void
+     let onCancel: () -> Void
+ 
+     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+-        // .open (not .import): the folder stays where it is and the bookmark keeps pointing at it.
++        // .open (not .import): the file or folder stays where it is and the bookmark keeps pointing at it (an import would copy 16 GB of game data into the app's container).
+         let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
+         picker.allowsMultipleSelection = false
+         picker.delegate = context.coordinator
+@@ -128,6 +186,7 @@ private struct LauncherView: View {
                      } footer: {
                          Text("Brings back all settings this game was tested with.")
                      }
 +                    GameDataSection()
+                     CloudSavesSection()
                      Section {
                          HStack {
-                             Text("Memory available")
 diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
-index db2e49ea..80def564 100644
+index 4fdb293c..a6f188eb 100644
 --- a/dm/ios/Sources/front_ios.m
 +++ b/dm/ios/Sources/front_ios.m
-@@ -17,6 +17,7 @@
+@@ -19,6 +19,7 @@
  int front_ios_boot_ok(void);
  const char *front_ios_boot_message(void);   // main.m: why a build that keeps the game files off the IPA found none usable (NULL = the generic hint)
  bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.swift: false = no launcher (no dm/launcher.json, or DM_LAUNCHER=0)
@@ -273,7 +265,7 @@ index db2e49ea..80def564 100644
  
  static CAMetalLayer *g_layer;
  static void front_ios_power_watch(void);
-@@ -48,6 +49,7 @@ @interface DmRootVC : UIViewController
+@@ -50,6 +51,7 @@ @interface DmRootVC : UIViewController
  @property (nonatomic, strong) UIView *pad;
  @property (nonatomic, strong) UILabel *fps;
  @property (nonatomic) BOOL launched;
@@ -281,7 +273,7 @@ index db2e49ea..80def564 100644
  - (void)startGame;
  @end
  static DmRootVC *g_root;
-@@ -70,6 +72,14 @@ - (void)viewDidLoad {
+@@ -72,6 +74,14 @@ - (void)viewDidLoad {
  // The game view, the pad and the frame-rate counter are made once the launcher has set the switches they read (DM_SHOW_FPS, DM_METAL_HUD); the host's loading began at app launch (main.m)
  - (void)startGame {
      if (self.game) return;
@@ -293,10 +285,10 @@ index db2e49ea..80def564 100644
 +        lb.text = @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart.";
 +        [self.view addSubview:lb]; return;
 +    }
+     dm_cloud_saves_env();   // DM_SAVE_SYNC from the launcher's Cloud saves pick, before the game's first save mount reads it (CloudSaves.m, save_sync.h)
      front_hud_env();   // before the game view makes its device (an env file's DM_METAL_HUD sets it in main.m already)
      self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
-     [self.view addSubview:self.game];
-@@ -105,7 +115,8 @@ - (void)viewDidAppear:(BOOL)a {
+@@ -108,7 +118,8 @@ - (void)viewDidAppear:(BOOL)a {
      }
      if (self.launched || !front_ios_boot_ok()) return;
      self.launched = YES; g_root = self;
@@ -307,7 +299,7 @@ index db2e49ea..80def564 100644
  - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
  - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
 diff --git a/dm/ios/Sources/main.m b/dm/ios/Sources/main.m
-index fb37046e..5afddbb6 100644
+index ca996cfb..193e2cac 100644
 --- a/dm/ios/Sources/main.m
 +++ b/dm/ios/Sources/main.m
 @@ -7,9 +7,10 @@
@@ -322,26 +314,33 @@ index fb37046e..5afddbb6 100644
  #include "romfs_identity.h"
  #include "player_env.h"
  #ifndef DM_PLAYER_BUILD
-@@ -40,9 +41,59 @@ static int romfs_identity_accepts(NSString *img) {
-     if (rc != ROMFS_ID_OK && rc != ROMFS_ID_NONE) fprintf(stderr, "[RED] boot: Documents/romfs.img is not the image this build needs (verdict %d); not used\n", rc);
+@@ -40,6 +41,38 @@ static int romfs_identity_accepts(NSString *img) {
+     if (rc != ROMFS_ID_OK && rc != ROMFS_ID_NONE) fprintf(stderr, "[RED] boot: Documents/%s is not the image this build needs (verdict %d); not used\n", img.lastPathComponent.UTF8String, rc);
      return rc == ROMFS_ID_OK || rc == ROMFS_ID_NONE;
  }
-+// A folder holds this game's files if it has a ROMFSARC index or the profile's marker path.
++// Set when a folder holds an old shard archive (romfs.idx): the launcher's Game data section shows it.
++static char g_old_archive[200];
++const char *dm_old_archive_message(void) { return g_old_archive[0] ? g_old_archive : NULL; }
++// A folder holds this game's files if it has the profile's marker path.
 +// Shared by romfs_locate and the per-game layout below, so both answer the same question.
 +static BOOL romfs_dir_ok(NSString *d) {
 +    NSFileManager *fm = NSFileManager.defaultManager;
-+    // A ROMFSARC archive: <dir>/romfs.idx next to romfs.NN shards. The host opens it when DM_ROMFS
-+    // points at the base; the marker check does not apply (there are no directories to walk).
-+    if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@"romfs.idx"]]) return YES;
 +    // A plain directory tree: only one containing the game profile's romfs_marker path counts
 +    // (Mario: System/Resource, the resource size table). Runtime profile: the marker is a profile
 +    // value now; the compiled macro is only what dm_profile() falls back to without DM_PROFILE.
-+    return [fm fileExistsAtPath:[d stringByAppendingPathComponent:@(dm_profile()->romfs_marker)]];
++    if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@(dm_profile()->romfs_marker)]]) return YES;
++    // ROMFSARC shard archives (<dir>/romfs.idx next to romfs.NN) are no longer read: the folder is
++    // reported as holding no game data, and the log and the launcher's Game data section name the action.
++    if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@"romfs.idx"]]) {
++        snprintf(g_old_archive, sizeof g_old_archive, "The game data here is an old shard archive (romfs.idx), which this version no longer reads. Re-send the game data as romfs.img from the launcher.");
++        fprintf(stderr, "boot: %s holds an old RomFS shard archive (romfs.idx), which is no longer read. Re-send the game data as romfs.img from the launcher\n", d.fileSystemRepresentation);
++    }
++    return NO;
 +}
 +
 +// Where one game's data lives under the per-game layout: Documents/games/<title ID>/, holding
 +//   romfs.img   the whole RomFS as one image file (what scripts/push_romfs.sh sends), or
-+//   romfs/      a ROMFSARC archive or a plain tree, for copies made before images
++//   romfs/      a plain tree, for copies made before images
 +//   msl/        this game's Metal shader libraries (optional; the app's own dm/ is used otherwise)
 +//   save/ temp/ this game's saves and scratch space
 +// The layout exists so several games can share one installed app and so the game data can sit on
@@ -351,6 +350,10 @@ index fb37046e..5afddbb6 100644
 +    return [[doc stringByAppendingPathComponent:@"games"] stringByAppendingPathComponent:@(title_id)];
 +}
 +
+ // The images in Documents: romfs.img in any letter case, romfs.img itself first. The NSP script writes the image as RomFS.img (extract/<version>/RomFS.img) and the Mac's
+ // file system ignores letter case, but iOS's does not: a copy made through Finder or the Files app keeps the source's name, which an exact lookup of romfs.img never finds
+ static NSArray<NSString *> *romfs_document_images(NSString *doc) {
+@@ -55,6 +88,31 @@ static int romfs_identity_accepts(NSString *img) {
  static NSString *romfs_locate(void) {
      NSFileManager *fm = NSFileManager.defaultManager;
      NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
@@ -379,10 +382,10 @@ index fb37046e..5afddbb6 100644
 +    if (romfs_image_complete(gimg)) return gimg;
 +    NSString *gfolder = [gdir stringByAppendingPathComponent:@"romfs"];
 +    if ([fm fileExistsAtPath:gfolder] && romfs_dir_ok(gfolder)) return gfolder;
-     NSString *img = [doc stringByAppendingPathComponent:@"romfs.img"];
-     if (romfs_image_complete(img) && romfs_identity_accepts(img)) {
+     for (NSString *img in romfs_document_images(doc)) {
+         if (!romfs_image_complete(img) || !romfs_identity_accepts(img)) continue;
          // A folder copy from before images is now dead weight of up to many GB (often cut off partway). Deleting its 300,000 files here took longer than iOS allows an app to start
-@@ -58,13 +109,48 @@ static int romfs_identity_accepts(NSString *img) {
+@@ -70,13 +128,48 @@ static int romfs_identity_accepts(NSString *img) {
      }
      NSString *bundledImage = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs.img"];
      NSString *documentFolder = [doc stringByAppendingPathComponent:@"romfs"];
@@ -431,9 +434,9 @@ index fb37046e..5afddbb6 100644
 +int dm_locate_game_data(void) { return set_data_env(romfs_locate(), YES); }
 +
  // Boot prerequisites (done before UIApplicationMain): directories / environment variables / log -- the host's early load reads these
- // Why a slim build found no usable game files: the verdict on Documents/romfs.img, in the log and for the screen (front_ios_boot_message). NULL when the build has no romfs.id
+ // Why a slim build found no usable game files: the verdict on Documents/romfs.img (the first of romfs_document_images), in the log and for the screen (front_ios_boot_message). NULL when the build has no romfs.id
  static char g_boot_message[640];
-@@ -127,15 +213,20 @@ static int boot_env(void) {
+@@ -139,16 +232,28 @@ static int boot_env(void) {
      NSString *lang = [NSBundle.mainBundle objectForInfoDictionaryKey:@"DMLanguage"];
      if (!getenv("DM_LANG") && [lang isKindOfClass:NSString.class] && lang.length) setenv("DM_LANG", lang.UTF8String, 0);
      fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
@@ -458,22 +461,31 @@ index fb37046e..5afddbb6 100644
 +    NSString *msl = (per_game && [fm fileExistsAtPath:per_game_msl]) ? per_game_msl : [res stringByAppendingPathComponent:@"msl"];
 +    setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
      setenv("DM_FONT_DIR", [dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
++    // Add-on content beside the game data: the launcher's games/<id>/aoc/ holds <index>.img (the layout hle_fs.c aoc_dir reads), because a slim IPA does not carry it. Taken before
++    // <App>/aoc and never over an explicit DM_AOC_DIR. A Documents/aoc folder (seedds/nxnative#486) stays compatible: it only ever fills DM_AOC_DIR when this did not.
++    NSString *per_game_aoc = [gdir stringByAppendingPathComponent:@"aoc"];
++    BOOL aoc_isdir = NO;
++    if (per_game && [fm fileExistsAtPath:per_game_aoc isDirectory:&aoc_isdir] && aoc_isdir) setenv("DM_AOC_DIR", per_game_aoc.fileSystemRepresentation, 0);
++    // Cheats (dm/host/hle_cheats.c, docs/frontends.md "Cheats"): a front end copies the game's cheat files to Documents/games/<id>/cheats, next to its saves. The host never creates the folder and an explicit DM_CHEATS (an env file) wins.
++    setenv("DM_CHEATS", [gdir stringByAppendingPathComponent:@"cheats"].fileSystemRepresentation, 0);
      NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
      if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
+     NSString *pso = [res stringByAppendingPathComponent:@"pso"];   // the pipeline archive made offline (build_ipa.sh, dm/gfx/tools/pso_offline.py): the shader pairs' bases, which the device then does not build
 diff --git a/dm/ios/project.yml b/dm/ios/project.yml
-index 4a1e3b65..298b2eed 100644
+index 1f97e69a..5e03e337 100644
 --- a/dm/ios/project.yml
 +++ b/dm/ios/project.yml
-@@ -76,6 +76,7 @@ targets:
+@@ -76,7 +76,7 @@ targets:
        OTHER_CFLAGS: $(inherited) -mcpu=apple-a18   # The host assembly contains LSE atomic instructions, which the default baseline does not accept
        CLANG_ENABLE_OBJC_ARC: YES
        SWIFT_VERSION: "5.0"                         # Launcher.swift (SwiftUI)
-+      SWIFT_OBJC_BRIDGING_HEADER: Sources/DmIOS-Bridging-Header.h   # DataBookmark (the Files app pick)
+-      SWIFT_OBJC_BRIDGING_HEADER: Sources/DmIOS-Bridging-Header.h   # CloudSaves.h (the cloud-save folder pick)
++      SWIFT_OBJC_BRIDGING_HEADER: Sources/DmIOS-Bridging-Header.h   # CloudSaves.h (the cloud-save folder pick), DataBookmark.h (the Files app pick)
        DEBUG_INFORMATION_FORMAT: dwarf
        GCC_WARN_INHIBIT_ALL_WARNINGS: YES
  schemes:
 diff --git a/dm/ios/tests/test_romfs_startup.py b/dm/ios/tests/test_romfs_startup.py
-index b31ad6ed..82d0ff92 100644
+index 9f1e9fd9..f9e4552a 100644
 --- a/dm/ios/tests/test_romfs_startup.py
 +++ b/dm/ios/tests/test_romfs_startup.py
 @@ -24,12 +24,19 @@ class Startup(unittest.TestCase):
@@ -498,9 +510,9 @@ index b31ad6ed..82d0ff92 100644
                            'if (!p) return 1; puts(p.fileSystemRepresentation); return 0; }}\n')
          cls.locator = root / 'locator'
          subprocess.run(['clang', '-fobjc-arc', '-Wall', '-Werror', '-I', str(REPO / 'dm/host'),
-@@ -92,5 +99,35 @@ class Startup(unittest.TestCase):
-             shutil.copy(root / 'other.img', doc / 'romfs.img')
-             self.assertEqual(locate().stdout.strip(), str(doc / 'romfs.img'))
+@@ -120,5 +127,43 @@ class Startup(unittest.TestCase):
+         (doc / 'romfs.img').write_bytes(b'cut off')   # an incomplete exact name: the complete other spelling
+         self.assertEqual(locate().stdout.strip(), str(doc / 'RomFS.img'))
  
 +    def test_the_location_the_player_picked_wins_over_everything(self):
 +        """The Files-app pick (DataBookmark): an image, a folder holding one, or a plain tree."""
@@ -531,6 +543,14 @@ index b31ad6ed..82d0ff92 100644
 +            # 4. a picked path holding none of this game's data falls through to the app's own copy
 +            empty = root / 'empty'; empty.mkdir()
 +            self.assertEqual(locate(empty), str(doc / 'romfs.img'))
++
++    def test_per_game_aoc_folder_is_taken_before_the_bundled_one(self):
++        """Slim builds carry no add-on content: games/<id>/aoc (the layout hle_fs.c aoc_dir reads) must reach DM_AOC_DIR, before <App>/aoc and never over an explicit value."""
++        main = (REPO / 'dm/ios/Sources/main.m').read_text()
++        per_game = main.index('setenv("DM_AOC_DIR", per_game_aoc.fileSystemRepresentation, 0)')
++        bundled = main.index('setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0)')
++        self.assertLess(per_game, bundled)
++        self.assertIn('per_game && [fm fileExistsAtPath:per_game_aoc', main)   # only when the per-game folder is in use
 +
  
  if __name__ == '__main__': unittest.main()

@@ -48,6 +48,12 @@ game it adds its built app's patches and the last 200 lines of its log. The home
 folder is shown as `~`, a log line holding key material (`name = <hex>`, as in
 `prod.keys`) keeps only its name, and no environment variables are included.
 
+Every dependency check also writes `deps-check.txt` beside `library.json`
+(`~/Library/Application Support/NS Port Builder/`): each row's verdict, the
+interpreter paths that were tried, and the `HOME` and `PATH` the panel ran with.
+That is the file to attach when the panel and the terminal disagree — a Finder
+launch gives the app a different PATH from the shell's.
+
 A completed Mac build appears in the collection automatically and can be started
 with **Play**. An iPhone build, by default, offers its unsigned IPA and the
 sideloading and RomFS-copy instructions.
@@ -104,6 +110,30 @@ the game runs on the Mac. Close it on the device too, or it writes its own save 
 copy later. The device side uses the install's route: `devicectl device info files` for
 the date and `devicectl device copy from` / `copy to` with the app's data container. Only
 a game installed from here has a known bundle ID, so a sideloaded IPA has no device side.
+
+## Cheats
+
+**Manage > Cheats…** manages a game's cheat files, the contract that `docs/frontends.md` ("Cheats") describes and
+the host reads (`dm/host/hle_cheats.c`, carried here from [seedds/nxnative#406](https://github.com/seedds/nxnative/pull/406)
+while it is open). The files live in `~/Library/Application Support/nxnative/<title ID>/cheats`, which is what the Mac
+app's launcher (`dm/mac/launcher.c`) sets `DM_ROOT` to, whatever the library folder is.
+
+- **Import** by dropping onto the sheet or **Import…**: a Ryujinx folder, an SD card's `atmosphere/contents/<title ID>/cheats`
+  (or the card itself, where another game's folder is left out), or single `<build ID>.txt` files. Each comes in as
+  `<build ID>.txt` in upper case, replacing an older file of that build, with the `.meta.tsv` of `scripts/cheat_anchor.py`
+  beside it when there is one. A file whose name carries no build ID is reported, since it cannot be matched to a version.
+- **Switches.** The sheet names the build ID the game uses (`# BUILD_ID` in the app's `dm/main.fixups.tsv`, the first 16 digits)
+  and marks the file for it. Files for other builds are listed dimmed without switches. Each cheat of this build's file has a
+  switch, written at once to `<build ID>.enabled` (one name per line, `Name #2` for a duplicate, never masters, labels,
+  one-pass cheats or the off half of an on / off pair), the file the game's own Cheats panel reads and writes. **Run cheats
+  in the game** is the master switch (the flag file `.cheats-off-<title ID>`).
+- **iPhone / iPad.** For a game installed from here, **Copy to iPhone** replaces the app's `Documents/games/<title ID>/cheats`
+  with this folder over the install's route (`devicectl device copy to`, as the Saves sheet does), without the Mac's
+  safe-mode flag. The iOS app points `DM_CHEATS` at that folder (fork patch `ios-game-data-folder`), so copy again after a
+  change.
+
+The host reads the files when the game starts, or on its Reload cheats (⌘R) on the Mac, and never watches the folder. So a
+change while the game runs applies after a reload, and the sheet says so. Live switching from the launcher is not part of it.
 
 ## Your games folder
 
@@ -225,17 +255,24 @@ A GUI app does not inherit the shell's PATH. On a machine where a terminal sees
 actually are (`~/.dotnet`, `/usr/local/share/dotnet`, the Python framework
 installs), verifies `.NET` with `--list-sdks` (the extractor targets `net10.0`),
 and picks the first interpreter that can really import
-`lz4 capstone fontTools backports.zstd`. That same interpreter then runs the
+`lz4 capstone fontTools zbic backports.zstd`. That same interpreter then runs the
 build.
+
+The interpreters uv installs (`uv python install`) count as well: they live in
+`~/.local/share/uv/python` (or `UV_PYTHON_INSTALL_DIR`) with shims in
+`~/.local/bin`, neither of which a GUI launch's PATH contains, and a uv user
+often has no Homebrew and no python.org framework at all. When no interpreter is
+found, **Install** creates the app's venv from the newest one that does run at
+3.12 or newer rather than from the venv path it is about to create.
 
 ### The bundled build tools and Python
 
 The release app (`NX2Apple.app`) carries `zstd`, `glslangValidator`, `spirv-cross`, `xcodegen` (in
 `Contents/Resources/tools/bin`) and a relocatable CPython 3.13 with `lz4 capstone fonttools
-backports.zstd nsz` (`Contents/Resources/python`), so a player needs no Homebrew and no Python.
+zbic backports.zstd nsz` (`Contents/Resources/python`), so a player needs no Homebrew and no Python.
 `tools/bundle_tools.sh` fills them in during the release workflow (pinned versions and sha256 of the
 sources, built for macOS 13 with static libraries, and the Python packages come from
-`tools/bundled-python-requirements.txt`) and `tools/check_bundle.sh` runs each tool from the bundle
+`bundled-python/requirements.txt`, exact pins with hashes that Dependabot keeps current) and `tools/check_bundle.sh` runs each tool from the bundle
 with a clean PATH. The dependency check (`BundledTools.swift`) prefers them to Homebrew's and shows
 "bundled", and the build's PATH starts with them. Under `swift run`, or in a build without the bundle,
 nothing changes: Homebrew's tools, a system Python or the launcher's venv. To try the bundle by hand:
@@ -244,10 +281,13 @@ nothing changes: Homebrew's tools, a system Python or the launcher's venv. To tr
 ## Language
 
 The interface follows the system language at every launch: any Chinese variant
-(Simplified, Traditional, Hong Kong, Taiwan) gets Chinese, every other language gets
-English, and the app has no language switch. Strings live in
-`Sources/NSPortBuilder/Localization.swift`. Regenerate the Qt table after editing
-it with `python3 frontend-qt/gen_localization.py` from the repository root.
+(Simplified, Traditional, Hong Kong, Taiwan) gets Chinese, Swedish gets Swedish, German gets
+German, and every other language gets English. Settings > Language overrides that. Strings live in
+`Sources/NSPortBuilder/Localization.swift`: the table holds Chinese and English, and Swedish (`sv`)
+and German (`de`) are overlays below it. A string added to the table needs its German entry, and
+`GermanLocalizationTests` fails until it has one (it also checks that the format placeholders match
+the English text). Regenerate the Qt table after editing it with
+`python3 frontend-qt/gen_localization.py` from the repository root.
 
 ## Verification
 

@@ -35,6 +35,9 @@ wherever `NSPB_REPO` points, and the repository group lets you pick it by hand.
 - Dependency detection per platform: Python + packages, .NET SDK, and either **Xcode + iOS SDK +
   Metal toolchain** (macOS) or the **Windows cross toolchain** (see [Windows build](#windows-build)),
   plus xcodegen / zstd / spirv-cross. Each row has an install button when a command can fix it.
+  The interpreter search covers the Pythons **uv** installs (`~/.local/share/uv/python`,
+  `~/.local/bin`, `UV_PYTHON_INSTALL_DIR`; `%LOCALAPPDATA%\uv\python` on Windows) and picks the
+  newest one that runs at 3.12 or newer — the script's own floor — with the build packages.
 - Pick a game folder (or its four inputs separately). Base / update / DLC / `prod.keys` are
   recognised from the dump names.
 - Build: runs the same script the SwiftUI app runs, streams its stage lines and log, then packs
@@ -114,7 +117,7 @@ Run this first if you prefer the command line. It lists what is missing and wher
 python -m nspb_qt.win.doctor
 ```
 
-1. **Python 3.10+**, then `pip install PySide6 lz4 capstone fonttools pillow`
+1. **Python 3.10+**, then `pip install PySide6 lz4 capstone fonttools zbic pillow`
    (and `backports.zstd` before Python 3.14).
 2. **.NET SDK 10** — the app downloads it (the zip, not the installer: no administrator rights,
    about 287 MB), or get it from <https://dotnet.microsoft.com/download/dotnet/10.0> (SDK, x64).

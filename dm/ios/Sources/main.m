@@ -1,5 +1,5 @@
 // iOS App entry: set the environment (game files, saves, shader libraries), write the host log to Documents/log.txt, create the window (front_ios.m), then run the host's dm_main on a big-stack thread.
-// The game files (RomFS) ship inside the App at <App>/romfs; Documents/romfs.img (one image, scripts/push_romfs.sh) or a Documents/romfs folder is also accepted (lets you swap them without reinstalling).
+// The game files (RomFS) ship inside the App at <App>/romfs; Documents/romfs.img (one image, scripts/push_romfs.sh; its name in any letter case) or a Documents/romfs folder is also accepted (lets you swap them without reinstalling).
 #import <UIKit/UIKit.h>
 #include <pthread.h>
 #include <signal.h>
@@ -39,25 +39,32 @@ static int romfs_image_complete(NSString *path) {
 static int romfs_identity_accepts(NSString *img) {
     romfs_id want, got;
     int rc = romfs_id_check([NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs.id"].fileSystemRepresentation, img.fileSystemRepresentation, &want, &got);
-    if (rc != ROMFS_ID_OK && rc != ROMFS_ID_NONE) fprintf(stderr, "[RED] boot: Documents/romfs.img is not the image this build needs (verdict %d); not used\n", rc);
+    if (rc != ROMFS_ID_OK && rc != ROMFS_ID_NONE) fprintf(stderr, "[RED] boot: Documents/%s is not the image this build needs (verdict %d); not used\n", img.lastPathComponent.UTF8String, rc);
     return rc == ROMFS_ID_OK || rc == ROMFS_ID_NONE;
 }
-// A folder holds this game's files if it has a ROMFSARC index or the profile's marker path.
+// Set when a folder holds an old shard archive (romfs.idx): the launcher's Game data section shows it.
+static char g_old_archive[200];
+const char *dm_old_archive_message(void) { return g_old_archive[0] ? g_old_archive : NULL; }
+// A folder holds this game's files if it has the profile's marker path.
 // Shared by romfs_locate and the per-game layout below, so both answer the same question.
 static BOOL romfs_dir_ok(NSString *d) {
     NSFileManager *fm = NSFileManager.defaultManager;
-    // A ROMFSARC archive: <dir>/romfs.idx next to romfs.NN shards. The host opens it when DM_ROMFS
-    // points at the base; the marker check does not apply (there are no directories to walk).
-    if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@"romfs.idx"]]) return YES;
     // A plain directory tree: only one containing the game profile's romfs_marker path counts
     // (Mario: System/Resource, the resource size table). Runtime profile: the marker is a profile
     // value now; the compiled macro is only what dm_profile() falls back to without DM_PROFILE.
-    return [fm fileExistsAtPath:[d stringByAppendingPathComponent:@(dm_profile()->romfs_marker)]];
+    if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@(dm_profile()->romfs_marker)]]) return YES;
+    // ROMFSARC shard archives (<dir>/romfs.idx next to romfs.NN) are no longer read: the folder is
+    // reported as holding no game data, and the log and the launcher's Game data section name the action.
+    if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@"romfs.idx"]]) {
+        snprintf(g_old_archive, sizeof g_old_archive, "The game data here is an old shard archive (romfs.idx), which this version no longer reads. Re-send the game data as romfs.img from the launcher.");
+        fprintf(stderr, "boot: %s holds an old RomFS shard archive (romfs.idx), which is no longer read. Re-send the game data as romfs.img from the launcher\n", d.fileSystemRepresentation);
+    }
+    return NO;
 }
 
 // Where one game's data lives under the per-game layout: Documents/games/<title ID>/, holding
 //   romfs.img   the whole RomFS as one image file (what scripts/push_romfs.sh sends), or
-//   romfs/      a ROMFSARC archive or a plain tree, for copies made before images
+//   romfs/      a plain tree, for copies made before images
 //   msl/        this game's Metal shader libraries (optional; the app's own dm/ is used otherwise)
 //   save/ temp/ this game's saves and scratch space
 // The layout exists so several games can share one installed app and so the game data can sit on
@@ -67,6 +74,18 @@ static NSString *game_dir_for(const char *title_id) {
     return [[doc stringByAppendingPathComponent:@"games"] stringByAppendingPathComponent:@(title_id)];
 }
 
+// The images in Documents: romfs.img in any letter case, romfs.img itself first. The NSP script writes the image as RomFS.img (extract/<version>/RomFS.img) and the Mac's
+// file system ignores letter case, but iOS's does not: a copy made through Finder or the Files app keeps the source's name, which an exact lookup of romfs.img never finds
+static NSArray<NSString *> *romfs_document_images(NSString *doc) {
+    NSMutableArray<NSString *> *imgs = [NSMutableArray array];
+    for (NSString *n in [NSFileManager.defaultManager contentsOfDirectoryAtPath:doc error:nil])
+        if ([n caseInsensitiveCompare:@"romfs.img"] == NSOrderedSame) [imgs addObject:[doc stringByAppendingPathComponent:n]];
+    [imgs sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        BOOL ea = [a.lastPathComponent isEqualToString:@"romfs.img"], eb = [b.lastPathComponent isEqualToString:@"romfs.img"];
+        return ea != eb ? (ea ? NSOrderedAscending : NSOrderedDescending) : [a compare:b];
+    }];
+    return imgs;
+}
 static NSString *romfs_locate(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
@@ -95,13 +114,13 @@ static NSString *romfs_locate(void) {
     if (romfs_image_complete(gimg)) return gimg;
     NSString *gfolder = [gdir stringByAppendingPathComponent:@"romfs"];
     if ([fm fileExistsAtPath:gfolder] && romfs_dir_ok(gfolder)) return gfolder;
-    NSString *img = [doc stringByAppendingPathComponent:@"romfs.img"];
-    if (romfs_image_complete(img) && romfs_identity_accepts(img)) {
+    for (NSString *img in romfs_document_images(doc)) {
+        if (!romfs_image_complete(img) || !romfs_identity_accepts(img)) continue;
         // A folder copy from before images is now dead weight of up to many GB (often cut off partway). Deleting its 300,000 files here took longer than iOS allows an app to start
         // (Tears of the Kingdom: killed on a black screen), so it is moved aside at once and deleted in the background, leftovers of an interrupted delete included
         NSString *old = [doc stringByAppendingPathComponent:@"romfs"], *tmp = NSTemporaryDirectory();
         if ([fm fileExistsAtPath:old] && [fm moveItemAtPath:old toPath:[tmp stringByAppendingPathComponent:[@"romfs-old-" stringByAppendingString:NSUUID.UUID.UUIDString]] error:nil])
-            fprintf(stderr, "boot: Documents/romfs moved aside for deletion (Documents/romfs.img replaces it)\n");
+            fprintf(stderr, "boot: Documents/romfs moved aside for deletion (Documents/%s replaces it)\n", img.lastPathComponent.UTF8String);
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
             NSFileManager *bfm = [NSFileManager new];
             for (NSString *n in [bfm contentsOfDirectoryAtPath:tmp error:nil]) if ([n hasPrefix:@"romfs-old-"]) [bfm removeItemAtPath:[tmp stringByAppendingPathComponent:n] error:nil];
@@ -170,13 +189,13 @@ int dm_locate_game_data(void) {
 }
 
 // Boot prerequisites (done before UIApplicationMain): directories / environment variables / log -- the host's early load reads these
-// Why a slim build found no usable game files: the verdict on Documents/romfs.img, in the log and for the screen (front_ios_boot_message). NULL when the build has no romfs.id
+// Why a slim build found no usable game files: the verdict on Documents/romfs.img (the first of romfs_document_images), in the log and for the screen (front_ios_boot_message). NULL when the build has no romfs.id
 static char g_boot_message[640];
 const char *front_ios_boot_message(void) { return g_boot_message[0] ? g_boot_message : NULL; }
 static void romfs_identity_report(NSString *doc) {
     romfs_id want, got;
     int rc = romfs_id_check([NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs.id"].fileSystemRepresentation,
-                            [doc stringByAppendingPathComponent:@"romfs.img"].fileSystemRepresentation, &want, &got);
+                            (romfs_document_images(doc).firstObject ?: [doc stringByAppendingPathComponent:@"romfs.img"]).fileSystemRepresentation, &want, &got);
     if (rc == ROMFS_ID_OK || rc == ROMFS_ID_NONE) return;
     romfs_id_message(rc, &want, &got, NSBundle.mainBundle.bundleIdentifier.UTF8String ?: "<bundle ID>", g_boot_message, sizeof g_boot_message);
     fprintf(stderr, "[RED] boot: %s\n", g_boot_message);
@@ -188,7 +207,7 @@ static int boot_env(void) {
     NSString *res = NSBundle.mainBundle.resourcePath;
     for (NSString *d in @[@"save", @"temp"]) [fm createDirectoryAtPath:[doc stringByAppendingPathComponent:d] withIntermediateDirectories:YES attributes:nil error:nil];
     // Keep game files and scratch data out of device backups (Documents is backed up by default; a RomFS placed there is many GB). Saves, logs and the pipeline list stay in the backup
-    for (NSString *d in @[@"romfs", @"romfs.img", @"temp"]) {
+    for (NSString *d in [@[@"romfs", @"temp"] arrayByAddingObjectsFromArray:[romfs_document_images(doc) valueForKey:@"lastPathComponent"]]) {
         NSURL *u = [NSURL fileURLWithPath:[doc stringByAppendingPathComponent:d]]; NSError *e = nil;
         if ([fm fileExistsAtPath:u.path] && ![u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&e]) fprintf(stderr, "boot: %s could not be excluded from backup: %s\n", d.UTF8String, e.localizedDescription.UTF8String);
     }
@@ -251,6 +270,13 @@ static int boot_env(void) {
     NSString *msl = ((per_game && [fm fileExistsAtPath:per_game_msl]) || downloaded_msl) ? per_game_msl : [res stringByAppendingPathComponent:@"msl"];
     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
     setenv("DM_FONT_DIR", [dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
+    // Add-on content beside the game data: the launcher's games/<id>/aoc/ holds <index>.img (the layout hle_fs.c aoc_dir reads), because a slim IPA does not carry it. Taken before
+    // <App>/aoc and never over an explicit DM_AOC_DIR. A Documents/aoc folder (seedds/nxnative#486) stays compatible: it only ever fills DM_AOC_DIR when this did not.
+    NSString *per_game_aoc = [gdir stringByAppendingPathComponent:@"aoc"];
+    BOOL aoc_isdir = NO;
+    if (per_game && [fm fileExistsAtPath:per_game_aoc isDirectory:&aoc_isdir] && aoc_isdir) setenv("DM_AOC_DIR", per_game_aoc.fileSystemRepresentation, 0);
+    // Cheats (dm/host/hle_cheats.c, docs/frontends.md "Cheats"): a front end copies the game's cheat files to Documents/games/<id>/cheats, next to its saves. The host never creates the folder and an explicit DM_CHEATS (an env file) wins.
+    setenv("DM_CHEATS", [gdir stringByAppendingPathComponent:@"cheats"].fileSystemRepresentation, 0);
     NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
     if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
     NSString *pso = [res stringByAppendingPathComponent:@"pso"];   // the pipeline archive made offline (build_ipa.sh, dm/gfx/tools/pso_offline.py): the shader pairs' bases, which the device then does not build

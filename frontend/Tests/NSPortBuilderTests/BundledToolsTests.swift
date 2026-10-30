@@ -188,18 +188,71 @@ final class BundledToolsTests: XCTestCase {
         XCTAssertNotEqual(BuildModel.findPython(resources: root).path, py)
     }
 
+    /// The order of #107 and #154: the bundled Python (when it runs, is new enough and imports the
+    /// packages) beats a working uv interpreter; a damaged bundled one falls through to uv's.
+    func testBundledPythonBeatsUvAndAUvOneIsNextWhenItFails() throws {
+        let oldShim = BuildModel.uvShimDir, oldRoot = BuildModel.uvPythonRoot
+        defer { BuildModel.uvShimDir = oldShim; BuildModel.uvPythonRoot = oldRoot }
+        let good = "#!/bin/sh\ncase \"$2\" in *sys.version_info*) echo 3.13;; esac\nexit 0\n"
+        let shim = root.appendingPathComponent("uvhome/.local/bin")
+        try FileManager.default.createDirectory(at: shim, withIntermediateDirectories: true)
+        let uvPy = shim.appendingPathComponent("python3")
+        try Data(good.utf8).write(to: uvPy)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: uvPy.path)
+        BuildModel.uvShimDir = shim.path
+        BuildModel.uvPythonRoot = root.appendingPathComponent("uvhome/none").path
+        let bundled = try install("python/bin/python3", script: good)
+        XCTAssertEqual(BuildModel.findPython(resources: root).path, bundled)
+        try Data("#!/bin/sh\nexit 1\n".utf8).write(to: URL(fileURLWithPath: bundled))
+        XCTAssertTrue(BuildModel.pythonCandidates().contains(uvPy.path))
+        let next = BuildModel.findPython(resources: root)
+        XCTAssertNotEqual(next.path, bundled)
+    }
+
+    // ---- the interpreter probe ----
+
+    func testTheProbeRequiresZbicAndThePipPackagesInstallIt() {
+        XCTAssertTrue(BuildModel.importProbe.contains("zbic"))
+        for v in [(3, 12), (3, 13), (3, 14), (3, 15)] { XCTAssertTrue(BuildModel.pipPackages(v).contains("zbic"), "\(v)") }
+    }
+
+    func testAPythonWithoutZbicFailsTheProbe() throws {
+        let py = "/usr/bin/python3"
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: py))
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("nspb-probe-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for pkg in ["lz4", "capstone", "fontTools", "backports", "compression"] {
+            try FileManager.default.createDirectory(at: dir.appendingPathComponent(pkg), withIntermediateDirectories: true)
+            try Data().write(to: dir.appendingPathComponent(pkg + "/__init__.py"))
+        }
+        try Data().write(to: dir.appendingPathComponent("backports/zstd.py"))
+        try Data().write(to: dir.appendingPathComponent("compression/zstd.py"))
+        let old = ProcessInfo.processInfo.environment["PYTHONPATH"]
+        setenv("PYTHONPATH", dir.path, 1)
+        defer { if let old { setenv("PYTHONPATH", old, 1) } else { unsetenv("PYTHONPATH") } }
+        XCTAssertFalse(BuildModel.importsOK(py), "zbic is missing")
+        try Data().write(to: dir.appendingPathComponent("zbic.py"))
+        XCTAssertTrue(BuildModel.importsOK(py), "everything the probe names is there")
+    }
+
     // ---- the pinned packages ----
 
     func testBundledPackagePinsCoverThePipPackages() throws {
         // frontend/Tests/NSPortBuilderTests/BundledToolsTests.swift -> frontend/tools
         var url = URL(fileURLWithPath: #filePath)
         for _ in 0..<3 { url.deleteLastPathComponent() }
-        let text = try String(contentsOf: url.appendingPathComponent("tools/bundled-python-requirements.txt"), encoding: .utf8)
-        let pins = text.split(separator: "\n").filter { !$0.hasPrefix("#") }
+        let text = try String(contentsOf: url.appendingPathComponent("bundled-python/requirements.txt"), encoding: .utf8)
+        // a requirement starts at column 0, its --hash lines are indented continuations
+        let pins = text.split(separator: "\n").filter { !$0.hasPrefix("#") && !$0.hasPrefix(" ") && !$0.isEmpty }
         let names = Set(pins.map { String($0.split(separator: "=", maxSplits: 1)[0]).lowercased() })
         for pkg in BuildModel.pipPackages((3, 13)) {
             XCTAssertTrue(names.contains(pkg.lowercased()), "\(pkg) is installed by the launcher's venv but not pinned for the bundle")
         }
         XCTAssertTrue(pins.allSatisfy { $0.contains("==") }, "every bundled package has an exact version")
+        for pin in pins {
+            let block = text.components(separatedBy: String(pin))[1].components(separatedBy: "\n\n")[0].split(separator: "\n").prefix { $0.hasPrefix(" ") }
+            XCTAssertFalse(block.isEmpty, "\(pin) has no hash")
+            XCTAssertTrue(block.allSatisfy { $0.contains("--hash=sha256:") }, String(pin))
+        }
     }
 }

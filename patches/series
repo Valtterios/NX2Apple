@@ -1,6 +1,5 @@
 # Applied in this order onto the commit in ../.upstream-ref with git am -3. See README.md.
 0001-runtime-profile.patch
-0002-romfsarc.patch
 0003-ios-game-data-folder.patch
 0004-ios-slim-ipa.patch
 0005-nsp-dotnet-home.patch
@@ -11,12 +10,13 @@
 0010-mac-library-folder.patch
 0011-hades2-update-profile.patch
 0012-env-switches-verify.patch
-0013-touchpad-geometry.patch
 0014-ios-probe.patch
 0015-fork-docs.patch
 0016-ref-hle-hid-d2r.patch
 0017-fork-patches-stamp.patch
 0018-nsp-dotnet-root-verify.patch
 0024-games-md-gallery.patch
-0025-cloud-saves.patch
-0026-lm3-depth-mode.patch
+0028-cheats-engine.patch
+0029-cheats-mac-panel.patch
+0030-front-mac-enter-fullscreen-once-the-app-is-activ.patch
+0031-front-mac-dm-screen.patch

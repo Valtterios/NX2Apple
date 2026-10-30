@@ -347,7 +347,7 @@ class HostSourcesTest(unittest.TestCase):
         files, incs = build_app.host_sources(self.repo, self.gen)
         names = {p.name for p in files}
         # from SRC=
-        for must in ('loader.c', 'hle.c', 'romfs_arc.c', 'crash.c', 'probe.c', 'thread.c',
+        for must in ('loader.c', 'hle.c', 'crash.c', 'probe.c', 'thread.c',
                      'memstat.m', 'haptics_apple.m', 'entry.S', 'main.c'):
             self.assertIn(must, names, f'{must} missing from the host source list')
         # Mac-only sources are dropped
@@ -375,7 +375,7 @@ class HostSourcesTest(unittest.TestCase):
             (fake / 'dm/host').mkdir(parents=True)
             makefile = (self.repo / 'dm/host/Makefile').read_text(encoding='utf-8')
             (fake / 'dm/host/Makefile').write_text(
-                makefile.replace('romfs_arc.c ', 'romfs_arc.c newfile.c '), encoding='utf-8')
+                makefile.replace('crash.c ', 'crash.c newfile.c '), encoding='utf-8')
             with self.assertRaises(SystemExit) as ctx:
                 build_app.host_sources(fake, self.gen)
             # host_sources() reports through build_app.die(), which raises SystemExit(1); the
@@ -1211,6 +1211,89 @@ class PythonInstallTest(unittest.TestCase):
             self.assertEqual(py, str(fake / 'python.exe'))
             self.assertFalse(ok)      # the packages are not installed in it (yet)
 
+    def test_python_candidates_include_uvs_managed_interpreters(self) -> None:
+        """`uv python install` keeps its Pythons outside every location the app used to probe.
+
+        Reported from a Mac whose only 3.12 was uv's: `uv` had the packages, the panel said no
+        interpreter was found. A GUI launch's PATH has neither uv's store nor ~/.local/bin.
+        """
+        from nspb_qt import platform_util as pu
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / 'python'
+            exe = store / 'cpython-3.12.13-macos-aarch64-none' / 'bin' / 'python3.12'
+            exe.parent.mkdir(parents=True)
+            exe.write_text('#!/bin/sh\n')
+            exe.chmod(0o755)
+            shim = Path(td) / '.local' / 'bin' / 'python3'
+            shim.parent.mkdir(parents=True)
+            shim.write_text('#!/bin/sh\n')
+            with mock.patch.object(pu, 'IS_WIN', False), \
+                    mock.patch.dict(os.environ, {'UV_PYTHON_INSTALL_DIR': str(store), 'HOME': td}):
+                cands = pu.uv_pythons()
+            self.assertIn(str(exe), cands, "uv's store holds the real interpreter")
+            self.assertIn(str(shim), cands, "uv links a python3 shim in ~/.local/bin")
+
+    def test_find_python_takes_a_uv_interpreter_when_it_is_the_only_one(self) -> None:
+        """The room's report: uv had a 3.12 with the packages and the panel still found nothing."""
+        from nspb_qt import platform_util as pu
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / 'python'
+            exe = store / 'cpython-3.12.13-macos-aarch64-none' / 'bin' / 'python3.12'
+            exe.parent.mkdir(parents=True)
+            exe.write_text('#!/bin/sh\n')
+            exe.chmod(0o755)
+            with mock.patch.object(pu, 'IS_WIN', False), \
+                    mock.patch.object(pu, 'venv_python', return_value=str(Path(td) / 'no-venv')), \
+                    mock.patch.object(pu, '_which', return_value=None), \
+                    mock.patch.object(pu, '_python_version', return_value='3.12.13'), \
+                    mock.patch.object(pu, '_runs', return_value=True), \
+                    mock.patch.object(pu.Path, 'is_file', lambda self: str(self) == str(exe)), \
+                    mock.patch.dict(os.environ, {'UV_PYTHON_INSTALL_DIR': str(store)}):
+                py, ok, ver = pu.find_python()
+            self.assertEqual(py, str(exe))
+            self.assertTrue(ok)
+            self.assertEqual(ver, '3.12.13')
+
+    def test_find_python_prefers_the_newest_interpreter_that_has_the_packages(self) -> None:
+        """A 3.9 with the packages must not win over a 3.12: the script needs 3.12.
+
+        Apple's /usr/bin/python3 is 3.9 and sits above uv's store in the candidate list, so the
+        old first-match-wins loop picked the one interpreter that cannot run the build.
+        """
+        from nspb_qt import platform_util as pu
+        with tempfile.TemporaryDirectory() as td:
+            old = Path(td) / 'python3.9'
+            new = Path(td) / 'python3.12'
+            for p in (old, new):
+                p.write_text('x')
+            versions = {str(old): '3.9', str(new): '3.12.13'}
+            with mock.patch.object(pu, 'python_candidates', return_value=[str(old), str(new)]), \
+                    mock.patch.object(pu, '_python_version', side_effect=lambda p: versions[p]), \
+                    mock.patch.object(pu, '_runs', return_value=True):
+                py, ok, ver = pu.find_python()
+            self.assertEqual((py, ok), (str(new), True))
+            self.assertEqual(ver, '3.12.13')
+
+    def test_venv_base_is_never_the_venv_it_has_to_create(self) -> None:
+        """The row's Install used to run `-m venv` on a path that does not exist yet."""
+        from nspb_qt import platform_util as pu
+        with tempfile.TemporaryDirectory() as td:
+            wanted = str(Path(td) / 'no-venv' / 'bin' / 'python3')
+            real = Path(td) / 'python3.12'
+            real.write_text('x')
+            real.chmod(0o755)
+            with mock.patch.object(pu, 'python_candidates', return_value=[wanted, str(real)]), \
+                    mock.patch.object(pu, '_python_version', return_value='3.12.13'):
+                self.assertEqual(pu.venv_base(wanted), str(real))
+                self.assertEqual(pu.venv_base(str(real)), str(real))
+
+    def test_venv_base_reports_no_interpreter_instead_of_a_broken_base(self) -> None:
+        from nspb_qt import platform_util as pu
+        with tempfile.TemporaryDirectory() as td:
+            wanted = str(Path(td) / 'no-venv' / 'bin' / 'python3')
+            with mock.patch.object(pu, 'python_candidates', return_value=[wanted]):
+                self.assertIsNone(pu.venv_base(wanted))
+
 
 class XcodeBetaTest(unittest.TestCase):
     """Xcode detection asks xcode-select, not a fixed /Applications/Xcode.app path.
@@ -1526,6 +1609,115 @@ class LocalizationTest(unittest.TestCase):
             en = t(k, Lang.EN)
             self.assertTrue(zh and zh != k, f'{k} has no Chinese text')
             self.assertTrue(en and en != k, f'{k} has no English text')
+
+    def test_the_guidance_and_pick_keys_exist_in_both_languages(self) -> None:
+        from nspb_qt.i18n import Lang
+        from nspb_qt.localization import TABLE, t
+        keys = ['dep.guide.iossdk', 'dep.guide.metal', 'dep.pick', 'dep.hide', 'dep.show',
+                'dep.pick.ios_sdk.title', 'dep.pick.metal_dir.title',
+                'dep.pick.saved', 'dep.pick.iossdk.saved', 'dep.pick.iossdk.version',
+                'dep.pick.iossdk.invalid', 'dep.fix.network', 'dep.fix.diskspace', 'dep.fix.log']
+        for k in keys:
+            self.assertIn(k, TABLE, f'{k} missing from the table')
+            zh, en = t(k, Lang.ZH), t(k, Lang.EN)
+            self.assertTrue(zh and zh != k and en and en != k, f'{k} is not bilingual')
+
+
+class SaveConfigTest(unittest.TestCase):
+    """The Choose-a-folder path writes toolchain.json and reads it back through setting()."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._old = os.environ.get('NSPB_TOOLCHAIN_JSON')
+        os.environ['NSPB_TOOLCHAIN_JSON'] = str(Path(self.tmp.name) / 'toolchain.json')
+
+    def tearDown(self) -> None:
+        if self._old is None:
+            os.environ.pop('NSPB_TOOLCHAIN_JSON', None)
+        else:
+            os.environ['NSPB_TOOLCHAIN_JSON'] = self._old
+
+    def test_save_config_keeps_other_keys_and_is_read_back(self) -> None:
+        cfg = Path(os.environ['NSPB_TOOLCHAIN_JSON'])
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('{"llvm_dir": "C:/tools/llvm"}', encoding='utf-8')
+        p = tc.save_config('ios_sdk', 'C:/sdks/iPhoneOS26.0.sdk')
+        self.assertEqual(p, cfg)
+        self.assertEqual(tc.setting('ios_sdk'), 'C:/sdks/iPhoneOS26.0.sdk')
+        self.assertEqual(tc.setting('llvm_dir'), 'C:/tools/llvm', 'the other keys survive')
+
+    def test_save_config_creates_missing_folders_and_replaces_a_broken_file(self) -> None:
+        cfg = Path(os.environ['NSPB_TOOLCHAIN_JSON'])
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('not json', encoding='utf-8')
+        tc.save_config('metal_dir', 'C:/Metal')
+        self.assertEqual(tc.setting('metal_dir'), 'C:/Metal')
+
+    def test_the_picked_sdk_is_accepted_only_when_it_really_is_one(self) -> None:
+        # The model validates before saving: a wrong pick must not become the configured answer.
+        root = Path(self.tmp.name)
+        unpacked = root / 'Metal-thing-unpacked'   # whatever the archive's top folder is called
+        unpacked.mkdir(parents=True)
+        good = make_fake_sdk(unpacked, '26.2')
+        self.assertTrue(tc.is_sdk_dir(good), 'the sdk folder itself')
+        self.assertFalse(tc.is_sdk_dir(unpacked), 'the folder above it is not an SDK by itself')
+        self.assertFalse(tc.is_sdk_dir(root / 'elsewhere'))
+        # ...but the model's pick accepts "one level down", so the unpacked root resolves to the SDK:
+        matches = sorted(unpacked.glob('iPhoneOS*.sdk'), reverse=True)
+        self.assertTrue(matches and all(tc.is_sdk_dir(m) for m in matches))
+
+
+class LinkProbeStrategyTest(unittest.TestCase):
+    """probe_link's three strategies and the step-0 linker self-check.
+
+    The Windows-only subprocess calls cannot run here; what is testable is the *shape*: the
+    strategy list (build-style fuse-ld first, then --ld-path, then -B), and that a silent
+    failure now names all three attempts plus the linker's own self-check instead of one
+    empty '(no output)'.
+    """
+
+    def test_the_strategy_order_is_build_style_first(self) -> None:
+        src = (QT / 'nspb_qt' / 'win' / 'toolchain.py').read_text()
+        body = src[src.index('def probe_link'):]
+        self.assertLess(body.index("'-fuse-ld=lld'"), body.index('f\'--ld-path={lld}\''),
+                        'the build\'s own invocation must be tried before --ld-path')
+        self.assertLess(body.index('f\'--ld-path={lld}\''), body.index("f'-B{lld.parent}'"),
+                        '--ld-path before the -B fallback')
+        self.assertIn("env['PATH'] = str(lld.parent)", body,
+                      'the build-style try must put the linker folder on PATH (build_app.link does)')
+        self.assertIn('does not run by itself', body,
+                      'a linker that cannot start is its own message, before any strategy runs')
+
+
+class InstallFailureHintTest(unittest.TestCase):
+    """The row's fix hint after a failed install (Mac parity: name the fix, not the traceback)."""
+
+    def test_network_disk_and_other_map_to_their_hints(self) -> None:
+        # model.py imports PySide6, which the test machine need not have: the classifier is a
+        # pure function, so its source is extracted and run standalone when Qt is absent.
+        try:
+            from nspb_qt import model as M
+            classify = M.Model._classify_install_failure
+        except ImportError:
+            import ast
+            src = (HERE.parent / 'nspb_qt' / 'model.py').read_text()
+            tree = ast.parse(src)
+            fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                      and n.name == '_classify_install_failure')
+            # A copied FunctionDef needs line numbers before compile accepts it.
+            ast.copy_location(fn, fn)
+            for n in ast.walk(fn):
+                ast.copy_location(n, n)
+                ast.fix_missing_locations(n)
+            ns: dict = {}
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                         '<model>', 'exec'), ns)
+            classify = ns['_classify_install_failure']
+        self.assertEqual(classify('DownloadError: connection reset by peer'), 'dep.fix.network')
+        self.assertEqual(classify('URLError: operation timed out'), 'dep.fix.network')
+        self.assertEqual(classify('OSError: [Errno 28] No space left on device'), 'dep.fix.diskspace')
+        self.assertEqual(classify('KeyError: x'), 'dep.fix.log')
 
 
 if __name__ == '__main__':
