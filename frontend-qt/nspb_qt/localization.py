@@ -285,6 +285,7 @@ TABLE: dict[str, tuple[str, str, str]] = {
     'cheats.dropHint': ('松开以导入金手指', 'Drop to import cheats', 'Släpp för att importera fusk'),
     'cheats.note': ('开关会立即保存，游戏下次启动时生效。', 'Switches are saved at once and apply the next time the game starts.', 'Reglagen sparas direkt och gäller nästa gång spelet startas.'),
     'cheats.noteDevice': ('更改后请再次复制到 %@。', 'Copy to %@ again after a change.', 'Kopiera till %@ igen efter en ändring.'),
+    'cheats.iosNote': ('金手指在 Mac 版应用中可用。在 iPhone 和 iPad 上，游戏启动时它们会被关闭，因为 iOS 不允许修改游戏的代码（seedds/nxnative#724）。', "Cheats work in the Mac app. On iPhone and iPad they are turned off when the game starts, because iOS does not allow changing the game's code (seedds/nxnative#724).", 'Fusk fungerar i Mac-appen. På iPhone och iPad stängs det av när spelet startar, eftersom iOS inte tillåter att spelets kod ändras (seedds/nxnative#724).'),
     'pad.manage': ('管理', 'Manage', 'Hantera'),
     'dev.signStage': ('为 %@ 签名', 'Sign for %@', 'Signerar för %@'),
     'dev.installStage': ('安装到 %@', 'Install on %@', 'Installerar på %@'),
