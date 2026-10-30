@@ -34,7 +34,7 @@ final class GameDataModel: ObservableObject {
     /// The download folder as the Files app shows it: inside LiveContainer, below its Data/Application/<app folder>/
     var whereShown: String {
         let p = gameDir.path
-        if let r = p.range(of: "/Data/Application/") { return "LiveContainer › Data › Application › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
+        if let r = p.range(of: "/Data/Application/", options: .backwards) {   // the last one: LiveContainer's own folder is a Data/Application/<id> too return "LiveContainer › Data › Application › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
         if let r = p.range(of: "/Documents/") { return "On My iPhone › \((info("CFBundleDisplayName") as? String) ?? "the game") › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
         return p
     }
@@ -85,7 +85,7 @@ final class GameDataModel: ObservableObject {
                 let ownShaders = Bundle.main.resourceURL.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("msl").appendingPathComponent(dm_shader_dir_name()).path) } ?? false
                 var files: [(GameDataManifest.Part, String)] = []
                 if let s = m.shaders, !ownShaders {   // an IPA that carries its shaders (the default build) does not fetch them again
-                    if let d = s.dir, d != dm_shader_dir_name() { throw GameDataError.mismatch("The server's shaders are \(d), this app needs \(dm_shader_dir_name()): publish them from the same build as the app.") }
+                    if let d = s.dir, d != dm_shader_dir_name() { throw GameDataError.mismatch("The server's shaders are \(d), this app needs \(dm_shader_dir_name() ?? "another version"): install the app from the same build as the server's data (or publish that build).") }
                     files.append((s, "msl.tar"))
                 }
                 files.append((m.romfs, "romfs.img"))
