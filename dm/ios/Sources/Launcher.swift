@@ -185,6 +185,7 @@ private struct LauncherView: View {
                         Text("Brings back all settings this game was tested with.")
                     }
                     GameDataSection()
+                    GameDataServerSection()
                     CloudSavesSection()
                     Section {
                         HStack {

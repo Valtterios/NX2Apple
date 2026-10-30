@@ -12,6 +12,7 @@
 #include "romfs_image.h"
 #include "DataBookmark.h"
 #include "romfs_identity.h"
+#import "GameData.h"
 #include "player_env.h"
 #ifndef DM_PLAYER_BUILD
 #define DM_PLAYER_BUILD 0
@@ -139,6 +140,19 @@ static int set_data_env(NSString *romfs, BOOL force) {
     BOOL per_game = [romfs hasPrefix:gdir];
     NSString *save_dir = per_game ? [gdir stringByAppendingPathComponent:@"save"] : [doc stringByAppendingPathComponent:@"save"];
     NSString *temp_dir = per_game ? [gdir stringByAppendingPathComponent:@"temp"] : [doc stringByAppendingPathComponent:@"temp"];
+    // Game data that moves into the per-game layout (a download from the game data server, GameDataSync.swift) must not leave the player's saves behind in
+    // Documents/save: the first time the per-game save folder is needed, it starts as a copy of them. A copy, not a move: the old folder stays as a backup
+    NSString *old_save = [doc stringByAppendingPathComponent:@"save"];
+    if (per_game && ![fm fileExistsAtPath:save_dir] && [fm fileExistsAtPath:old_save]) {
+        NSError *e = nil;
+        [fm createDirectoryAtPath:gdir withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([fm copyItemAtPath:old_save toPath:save_dir error:&e]) fprintf(stderr, "boot: saves copied from %s to the per-game folder %s\n", old_save.fileSystemRepresentation, save_dir.fileSystemRepresentation);
+        else fprintf(stderr, "[RED] boot: the saves in %s could not be copied to %s (%s)\n", old_save.fileSystemRepresentation, save_dir.fileSystemRepresentation, e.localizedDescription.UTF8String);
+    }
+    if (force) {   // at Play: shader libraries downloaded since the launch (GameDataSync.swift) are only found now; shmap_load reads DM_MSL_DIR when the game starts
+        NSString *dl = [[gdir stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
+        if ([fm fileExistsAtPath:dl]) setenv("DM_MSL_DIR", [gdir stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 1);
+    }
     for (NSString *d in @[save_dir, temp_dir]) [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
     setenv("DM_SAVE", save_dir.fileSystemRepresentation, force);
     setenv("DM_TEMP", temp_dir.fileSystemRepresentation, force);
@@ -149,7 +163,11 @@ static int set_data_env(NSString *romfs, BOOL force) {
 // front_ios.m calls this from the launcher's Play: (re)decide where the game data is — a location
 // picked in the launcher this session takes effect at once — and NO when there still is none, so
 // the launcher comes back instead of the game failing inside the host.
-int dm_locate_game_data(void) { return set_data_env(romfs_locate(), YES); }
+// It also says NO without shader libraries (an IPA built with --shaders separate, before its download): the launcher's Game data section shows what is missing.
+int dm_locate_game_data(void) {
+    if (!dm_have_shaders()) { fprintf(stderr, "[RED] boot: no shader libraries (an IPA built with --shaders separate): download the game data in the launcher\n"); return 0; }
+    return set_data_env(romfs_locate(), YES);
+}
 
 // Boot prerequisites (done before UIApplicationMain): directories / environment variables / log -- the host's early load reads these
 // Why a slim build found no usable game files: the verdict on Documents/romfs.img, in the log and for the screen (front_ios_boot_message). NULL when the build has no romfs.id
@@ -227,8 +245,10 @@ static int boot_env(void) {
     setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
     // Shader libraries: a game's own <gdir>/msl first (a per-game layout may carry its own), else
     // the app's shared <App>/msl.
+    // A downloaded set (GameDataSync.swift) counts wherever the game files are: an IPA built with --shaders separate has no <App>/msl at all
     NSString *per_game_msl = [gdir stringByAppendingPathComponent:@"msl"];
-    NSString *msl = (per_game && [fm fileExistsAtPath:per_game_msl]) ? per_game_msl : [res stringByAppendingPathComponent:@"msl"];
+    BOOL downloaded_msl = [fm fileExistsAtPath:[per_game_msl stringByAppendingPathComponent:dm_shader_dir_name()]];
+    NSString *msl = ((per_game && [fm fileExistsAtPath:per_game_msl]) || downloaded_msl) ? per_game_msl : [res stringByAppendingPathComponent:@"msl"];
     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
     setenv("DM_FONT_DIR", [dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
     NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
