@@ -38,6 +38,7 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationLandscapeRight
           - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationPortrait  # only while a foldable is half-folded (laptop mode, front_ios.m supportedInterfaceOrientations)
         UIRequiresFullScreen: true
         UIStatusBarHidden: true
         UIViewControllerBasedStatusBarAppearance: false

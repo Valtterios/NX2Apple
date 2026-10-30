@@ -48,7 +48,9 @@ static UILabel *front_ios_fps_label(void);
 
 @interface DmRootVC : UIViewController
 @property (nonatomic, strong) DmGameView *game;
+@property (nonatomic, strong) UIView *stage;   // the game's area, clipping the picture (DM_SCREEN_FIT=zoom overflows it): the whole screen, or the upright half in laptop mode
 @property (nonatomic, strong) UIView *pad;
+@property (nonatomic) BOOL split;   // laptop mode: a foldable half-folded (UIHinge partially open) with DM_HINGE_SPLIT on, the game above the fold and the pad below it
 @property (nonatomic, strong) UILabel *fps;
 @property (nonatomic) BOOL launched;
 @property (nonatomic) BOOL hasLauncher;   // the app has a settings screen: a failed Play goes back to it (its Game data section is the way out)
@@ -84,13 +86,16 @@ static void launcher_done(void) { [g_root startGame]; }
     }
     dm_cloud_saves_env();   // DM_SAVE_SYNC from the launcher's Cloud saves pick, before the game's first save mount reads it (DataBookmark.m, save_sync.h)
     front_hud_env();   // before the game view makes its device (an env file's DM_METAL_HUD sets it in main.m already)
+    self.stage = [[UIView alloc] initWithFrame:self.view.bounds];
+    self.stage.clipsToBounds = YES; self.stage.backgroundColor = UIColor.blackColor;
+    [self.view addSubview:self.stage];
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
-    [self.view addSubview:self.game];
+    [self.stage addSubview:self.game];
+    [self watchHinge];
     g_layer = (CAMetalLayer *)self.game.layer;
     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
     dm_haptics_apple_init();
-    self.pad = dm_gamepad_view(self.view.bounds);
-    self.pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.pad = dm_gamepad_view(self.view.bounds);   // framed in viewDidLayoutSubviews: the whole screen, or the flat half in laptop mode
     [self.view addSubview:self.pad];
     self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
     if (self.fps) [self.view addSubview:self.fps];
@@ -101,9 +106,22 @@ static void launcher_done(void) { [g_root startGame]; }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     CGRect b = self.view.bounds; if (!self.game) return;
-    CGFloat w = b.size.width, h = b.size.height;   // Fit 16:9 into the whole screen
-    if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
-    self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+    // Laptop mode: the hinge of a half-folded foldable runs across the middle of the portrait screen, so the upper half (upright) shows the game and the lower half (flat) the pad.
+    // DM_HINGE_SPLIT_AT moves the fold line (a fraction of the height, 0.5 by default) for a device whose hinge is not in the middle
+    CGRect area = b, padArea = b;
+    if (self.split && b.size.height > b.size.width) {
+        const char *at = getenv("DM_HINGE_SPLIT_AT"); double f = at ? atof(at) : 0.5; if (!(f >= 0.2 && f <= 0.8)) f = 0.5;
+        CGFloat top = floor(b.size.height * f);
+        area = CGRectMake(0, 0, b.size.width, top);
+        padArea = CGRectMake(0, top, b.size.width, b.size.height - top);
+    }
+    self.stage.frame = area; self.pad.frame = padArea;
+    CGFloat aw = area.size.width, ah = area.size.height, w = aw, h = ah;
+    const char *fit = getenv("DM_SCREEN_FIT");   // fit (default): 16:9 with black bars; zoom: 16:9 covering the area, its overflow clipped by the stage; stretch: the whole area
+    if (fit && !strcmp(fit, "stretch")) {}
+    else if (fit && !strcmp(fit, "zoom")) { if (w / h > 16.0 / 9.0) h = w * 9.0 / 16.0; else w = h * 16.0 / 9.0; }
+    else if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
+    self.game.frame = CGRectMake(floor((aw - w) / 2), floor((ah - h) / 2), w, h);
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
@@ -124,7 +142,27 @@ static void launcher_done(void) { [g_root startGame]; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
 - (BOOL)prefersStatusBarHidden { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return self.split ? UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskLandscape : UIInterfaceOrientationMaskLandscape; }   // laptop mode holds the screen upright, the fold across it (portrait); held sideways it stays the landscape layout
+// Foldables (iOS 27.1 UIHinge): half-folded with DM_HINGE_SPLIT on (the launcher's Laptop mode, on by default) splits the screen at the fold; flat or closed goes back to the landscape layout
+- (void)watchHinge {
+    const char *on = getenv("DM_HINGE_SPLIT");
+    if (on && !strcmp(on, "0")) return;
+    if (@available(iOS 27.1, *)) {
+        __weak DmRootVC *weak = self;
+        UIHingeInteraction *hi = [[UIHingeInteraction alloc] initWithUpdateHandler:^(UIHingeInteraction *i, UIHingeInteractionUpdate *u) {
+            (void)i; DmRootVC *me = weak; if (!me) return;
+            BOOL split = u.hinge && u.hinge.status == UIHingeStatusPartiallyOpen;
+            if (split == me.split) return;
+            me.split = split;
+            LOG("front end: %s (hinge %s, %.0f degrees)", split ? "laptop mode, game above the fold and controls below" : "full-screen layout",
+                !u.hinge ? "unavailable" : u.hinge.status == UIHingeStatusClosed ? "closed" : u.hinge.status == UIHingeStatusPartiallyOpen ? "half open" : u.hinge.status == UIHingeStatusFullyOpen ? "open" : "unknown",
+                u.hinge ? u.hinge.angle * 180.0 / M_PI : 0.0);
+            [me setNeedsUpdateOfSupportedInterfaceOrientations];
+            [me.view setNeedsLayout];
+        }];
+        [self.view addInteraction:hi];
+    }
+}
 @end
 UIViewController *front_ios_root(void) { return [DmRootVC new]; }
 
