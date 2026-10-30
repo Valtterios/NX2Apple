@@ -44,8 +44,8 @@ def place(src, dst, copy):
     shutil.copyfile(src, dst)
 
 
-def ustar(src_dir, tar_path):
-    """b-<version>/ and its files, in name order, as plain ustar: no pax headers, no compression (what the app's unpacker reads)."""
+def ustar(src_dir, tar_path, keep=lambda p: True):
+    """b-<version>/ and its files, in name order, as plain ustar: no pax headers, no compression (what the app's unpacker reads). keep: which files go in."""
     tmp = tar_path.with_suffix('.tar.tmp')
     with tarfile.open(tmp, 'w', format=tarfile.USTAR_FORMAT) as t:
         def add(p):
@@ -55,7 +55,8 @@ def ustar(src_dir, tar_path):
             else:
                 with open(p, 'rb') as f: t.addfile(info, f)
         add(src_dir)
-        for p in sorted(src_dir.rglob('*')): add(p)
+        for p in sorted(src_dir.rglob('*')):
+            if p.is_dir() or keep(p): add(p)
     tmp.replace(tar_path)
 
 
@@ -66,17 +67,18 @@ def main():
     ap.add_argument('--ipa', type=Path, help='the IPA to publish beside the data (its romfs.id must name this image)')
     ap.add_argument('--base-url', help='the server\'s public address, e.g. https://games.example.com: needed for source.json')
     ap.add_argument('--copy', action='store_true', help='copy the image instead of hard-linking it')
+    ap.add_argument('--with-pull-libs', action='store_true', help='keep the _bp.metallib pulling-vertex libraries, which build_ipa.sh leaves out unless the profile turns pso_mtl4 on (used only when the IPA has no shaders to copy the list from)')
     ap.add_argument('--no-shaders', action='store_true', help='leave the shader libraries out (for apps that carry their own)')
     a = ap.parse_args()
 
     builds = sorted(a.nsp_dir.expanduser().glob('*_build'))
     if len(builds) != 1: sys.exit(f'expected one <title ID>_build folder in {a.nsp_dir}, found {len(builds)}')
     work = builds[0]; title = work.name.split('_')[0].upper()
-    images = sorted((work / 'extract').glob('v*/RomFS.img'), key=lambda p: int(p.parent.name[1:]))
+    images = sorted((p for p in (work / 'extract').glob('v*/RomFS.img') if re.fullmatch(r'v\d+', p.parent.name)), key=lambda p: int(p.parent.name[1:]))   # not v0.partial/: an extraction cut off
     if not images: sys.exit(f'no RomFS.img in {work}/extract: build with --romfs separate first')
     image = images[-1]; build = image.parent.name
     ipa = (a.ipa or next(iter(sorted(a.nsp_dir.expanduser().glob('*.ipa'))), None))
-    expected = info = None
+    expected = info = None; ipa_msl = set()
     if ipa:
         with zipfile.ZipFile(ipa) as z:
             names = z.namelist()
@@ -84,6 +86,7 @@ def main():
             pl = next((n for n in names if re.fullmatch(r'Payload/[^/]+\.app/Info\.plist', n)), None)
             expected = z.read(idn).decode().strip() if idn else None
             info = plistlib.loads(z.read(pl)) if pl else {}
+            ipa_msl = {m.group(1) for n in names if (m := re.fullmatch(r'Payload/[^/]+\.app/msl/(b-[^/]+/.+[^/])', n))}
     version = (re.search(r'version=(\S+)', expected).group(1) if expected else None) or (info or {}).get('CFBundleShortVersionString') or build
     identity = subprocess.run([sys.executable, '-I', str(REPO / 'dm/tools/romfs_image.py'), '--identity', str(image), title, version, build],
                               check=True, capture_output=True, text=True).stdout.strip()
@@ -98,11 +101,15 @@ def main():
                     published=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                     romfs=part(dest / 'romfs.img', f'{build}/romfs.img', identity=identity))
     if not a.no_shaders:
-        libs = sorted((work / 'shader' / 'ios').glob('b-*'))
+        libs = sorted(p for p in (work / 'shader' / 'ios').glob('b-*') if p.is_dir())   # not b-<version>.key, the cache key beside it
         if not libs: sys.exit(f'no shader libraries in {work}/shader/ios (or pass --no-shaders)')
         tar = dest / 'msl.tar'
-        print(f'  msl.tar    {libs[-1].name}, packing…'); ustar(libs[-1], tar)
+        # the same files the IPA carries: its own list when it has one (a default build), else build_ipa.sh's rule for the pulling-vertex libraries
+        rel = lambda p: str(p.relative_to(libs[-1].parent))
+        keep = (lambda p: rel(p) in ipa_msl) if ipa_msl else (lambda p: a.with_pull_libs or not p.name.endswith('_bp.metallib'))
+        print(f'  msl.tar    {libs[-1].name}, packing{" the IPA\'s " + str(len(ipa_msl)) + " files" if ipa_msl else ""}…'); ustar(libs[-1], tar, keep)
         manifest['shaders'] = part(tar, f'{build}/msl.tar', dir=libs[-1].name)
+        if tar.stat().st_size < 1 << 20: sys.exit(f'{tar} is almost empty: {libs[-1]} holds no shader libraries')
         print(f'             {tar.stat().st_size / 1e9:.2f} GB')
     # manifest URLs are relative to the manifest: the per-build copy sits beside its files, the latest one a folder above
     (dest / 'manifest.json').write_text(json.dumps(dict(manifest, romfs=dict(manifest['romfs'], url='romfs.img'),
