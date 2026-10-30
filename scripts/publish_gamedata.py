@@ -120,11 +120,17 @@ def main():
     if ipa and a.base_url:
         bv = info.get('CFBundleVersion', '0')
         ipa_dst = a.out / 'ipa' / title / f'{build}-{bv}.ipa'; place(ipa, ipa_dst, True)
+        icon = image.parent / 'icon.jpg'   # the game's own icon, as the build saved it from the NSP's control data
+        icon_url = None
+        if icon.exists():
+            place(icon, a.out / 'ipa' / title / 'icon.jpg', True)
+            icon_url = f'{a.base_url.rstrip("/")}/ipa/{title}/icon.jpg'
         src = a.out / 'source.json'
         s = json.loads(src.read_text()) if src.exists() else dict(name='NX2Apple games', identifier='local.nx2apple.games', apps=[])
         bid = info.get('CFBundleIdentifier', f'org.nxnative.{title.lower()}')
         app = next((x for x in s['apps'] if x.get('bundleIdentifier') == bid), None)
         if not app: app = dict(name=info.get('CFBundleDisplayName', title), bundleIdentifier=bid, developerName='NX2Apple (your build)', localizedDescription=f'Your build of {title}. Game data: {a.base_url.rstrip("/")}/data', versions=[]); s['apps'].append(app)
+        if icon_url: app['iconURL'] = icon_url   # the server's index step adds the token, as it does to downloadURL
         app['versions'] = [v for v in app['versions'] if v.get('buildVersion') != bv]
         app['versions'].insert(0, dict(version=info.get('CFBundleShortVersionString', version), buildVersion=bv, date=manifest['published'],
                                        downloadURL=f'{a.base_url.rstrip("/")}/ipa/{title}/{ipa_dst.name}', size=ipa_dst.stat().st_size, minOSVersion=info.get('MinimumOSVersion', '26.0')))

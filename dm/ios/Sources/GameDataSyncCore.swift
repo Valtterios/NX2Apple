@@ -59,7 +59,7 @@ final class GameDataProgress: @unchecked Sendable {
     func add(done d: Int64, fetched f: Int64) { lock.withLock { _done += d; _fetched += f } }
 }
 
-private extension Range where Bound == Int64 { var len: Int64 { upperBound - lowerBound } }
+extension Range where Bound == Int64 { var len: Int64 { upperBound - lowerBound } }
 
 final class GameDataSync: @unchecked Sendable {
     static let chunkParallel = 6
@@ -83,7 +83,7 @@ final class GameDataSync: @unchecked Sendable {
         session = URLSession(configuration: c)
     }
 
-    private func request(_ url: URL, range: Range<Int64>? = nil) -> URLRequest {
+    func request(_ url: URL, range: Range<Int64>? = nil) -> URLRequest {
         var r = URLRequest(url: url)
         if !token.isEmpty { r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let g = range { r.setValue("bytes=\(g.lowerBound)-\(g.upperBound - 1)", forHTTPHeaderField: "Range") }
@@ -140,21 +140,28 @@ final class GameDataSync: @unchecked Sendable {
         throw CancellationError()
     }
 
-    private func hex<D: Digest>(_ d: D) -> String { d.map { String(format: "%02x", $0) }.joined() }
-    private func ranges(_ p: GameDataManifest.Part) -> [Range<Int64>] {
+    func hex<D: Digest>(_ d: D) -> String { d.map { String(format: "%02x", $0) }.joined() }
+    func ranges(_ p: GameDataManifest.Part) -> [Range<Int64>] {
         (0..<p.chunks.count).map { i in Int64(i) * p.chunkSize ..< min(Int64(i + 1) * p.chunkSize, p.size) }
     }
 
     // MARK: one file of the game data (the image, the shader archive)
 
-    private struct ImageState: Codable { var identity: String; var size: Int64; var chunkSize: Int64; var done: [Bool] }
+    struct FileState: Codable { var identity: String; var size: Int64; var chunkSize: Int64; var done: [Bool] }
+    /// What a download of one file needs after a restart, kept as <name>.part.plan.json: the background mode (GameDataBackground.swift) reads it when iOS
+    /// hands it finished pieces, perhaps in a later launch of the app
+    struct FilePlan: Codable { var name: String; var url: URL; var size: Int64; var chunkSize: Int64; var chunks: [String]; var identity: String }
 
-    /// Brings gameDir/<name> (romfs.img, msl.tar) to the manifest's file. accepts: the final check on a complete file (for the image, main.m's identity check on the device).
-    func syncFile(_ p: GameDataManifest.Part, base: URL, name: String, accepts: (URL) -> Bool = { _ in true }) async throws {
+    func planURL(_ name: String) -> URL { gameDir.appendingPathComponent(name + ".part.plan.json") }
+    func stateURL(_ name: String) -> URL { gameDir.appendingPathComponent(name + ".part.json") }
+    func partURL(_ name: String) -> URL { gameDir.appendingPathComponent(name + ".part") }
+
+    /// Readies gameDir/<name>.part for the manifest's file: a previous version or an interrupted download becomes the starting point, and every piece
+    /// that already matches is kept. Returns the pieces still to fetch (none: finish() completes it).
+    func prepare(_ p: GameDataManifest.Part, base: URL, name: String) async throws -> [Int] {
         let fm = FileManager.default
         try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
-        let final = gameDir.appendingPathComponent(name), part = gameDir.appendingPathComponent(name + ".part")
-        let stateURL = gameDir.appendingPathComponent(name + ".part.json")
+        let final = gameDir.appendingPathComponent(name), part = partURL(name), stateURL = stateURL(name)
         guard p.chunks.count == Int((p.size + p.chunkSize - 1) / max(p.chunkSize, 1)) else { throw GameDataError.server("the manifest's chunk list does not cover \(name)") }
         // A previous version becomes the starting point: its chunks that still match are kept (an update fetches only what changed), with no second copy
         if fm.fileExists(atPath: final.path) && !fm.fileExists(atPath: part.path) { try fm.moveItem(at: final, to: part) }
@@ -164,9 +171,9 @@ final class GameDataSync: @unchecked Sendable {
         defer { close(fd) }
         guard ftruncate(fd, off_t(p.size)) == 0 else { throw GameDataError.local("not enough space for \(p.size / 1_000_000) MB (errno \(errno))") }
         let id = p.identity ?? p.sha256
-        var state = (try? JSONDecoder().decode(ImageState.self, from: Data(contentsOf: stateURL))).flatMap {
+        var state = (try? JSONDecoder().decode(FileState.self, from: Data(contentsOf: stateURL))).flatMap {
             $0.identity == id && $0.size == p.size && $0.chunkSize == p.chunkSize && $0.done.count == p.chunks.count ? $0 : nil
-        } ?? ImageState(identity: id, size: p.size, chunkSize: p.chunkSize, done: Array(repeating: false, count: p.chunks.count))
+        } ?? FileState(identity: id, size: p.size, chunkSize: p.chunkSize, done: Array(repeating: false, count: p.chunks.count))
         let rs = ranges(p)
         progress.set(phase: "Checking the data on the phone", total: progress.total + p.size)
         for (i, r) in rs.enumerated() where state.done[i] { progress.add(done: r.len, fetched: 0) }
@@ -182,8 +189,19 @@ final class GameDataSync: @unchecked Sendable {
             todo.append(i)
         }
         try JSONEncoder().encode(state).write(to: stateURL, options: .atomic)
+        let plan = FilePlan(name: name, url: URL(string: p.url, relativeTo: base)!.absoluteURL, size: p.size, chunkSize: p.chunkSize, chunks: p.chunks, identity: id)
+        try JSONEncoder().encode(plan).write(to: planURL(name), options: .atomic)
+        return todo
+    }
+
+    /// Fetches the pieces in this process, several at a time (the app has to stay open; the background mode is GameDataBackground.swift).
+    func fetchForeground(_ p: GameDataManifest.Part, base: URL, name: String, todo: [Int]) async throws {
+        let fd = open(partURL(name).path, O_RDWR); guard fd >= 0 else { throw GameDataError.local("cannot open \(name).part (errno \(errno))") }
+        defer { close(fd) }
+        let stateURL = stateURL(name)
+        var state = try JSONDecoder().decode(FileState.self, from: Data(contentsOf: stateURL))
+        let rs = ranges(p), url = URL(string: p.url, relativeTo: base)!.absoluteURL
         progress.set(phase: todo.isEmpty ? "Checking" : name == "romfs.img" ? "Downloading game files" : "Downloading shaders")
-        let url = URL(string: p.url, relativeTo: base)!.absoluteURL
         let lock = NSLock(); var sinceSave = 0
         try await withThrowingTaskGroup(of: Void.self) { g in
             var next = todo.makeIterator()
@@ -194,7 +212,7 @@ final class GameDataSync: @unchecked Sendable {
                     let w = d.withUnsafeBytes { pwrite(fd, $0.baseAddress, d.count, off_t(r.lowerBound)) }
                     guard w == d.count else { throw GameDataError.local("write failed at \(r.lowerBound) (errno \(errno)): is the phone full?") }
                     progress.add(done: r.len, fetched: r.len)
-                    let snapshot: ImageState? = lock.withLock { state.done[i] = true; sinceSave += 1; if sinceSave >= 8 { sinceSave = 0; return state }; return nil }
+                    let snapshot: FileState? = lock.withLock { state.done[i] = true; sinceSave += 1; if sinceSave >= 8 { sinceSave = 0; return state }; return nil }
                     if let s = snapshot { fsync(fd); try? JSONEncoder().encode(s).write(to: stateURL, options: .atomic) }
                 }
                 return true
@@ -204,17 +222,36 @@ final class GameDataSync: @unchecked Sendable {
             catch { g.cancelAll(); fsync(fd); try? JSONEncoder().encode(lock.withLock { state }).write(to: stateURL, options: .atomic); throw error }
         }
         fsync(fd)
+        try JSONEncoder().encode(state).write(to: stateURL, options: .atomic)
+    }
+
+    /// True when every piece of <name> is in place (by its state file).
+    func complete(_ name: String) -> Bool {
+        (try? JSONDecoder().decode(FileState.self, from: Data(contentsOf: stateURL(name))))?.done.allSatisfy { $0 } ?? false
+    }
+
+    /// Swaps a complete <name>.part in as <name>. accepts: the final check (for the image, main.m's identity check on the device).
+    func finish(_ name: String, accepts: (URL) -> Bool = { _ in true }) throws {
+        let fm = FileManager.default, final = gameDir.appendingPathComponent(name), part = partURL(name)
+        guard complete(name) else { throw GameDataError.local("\(name) is not complete yet") }
         progress.set(phase: "Checking")
         guard accepts(part) else { throw GameDataError.mismatch("The downloaded \(name) is complete but is not the one this app needs: the server has another version.") }
         if fm.fileExists(atPath: final.path) { try fm.removeItem(at: final) }
         try fm.moveItem(at: part, to: final)
-        try? fm.removeItem(at: stateURL)
+        try? fm.removeItem(at: stateURL(name)); try? fm.removeItem(at: planURL(name))
+    }
+
+    /// Brings gameDir/<name> (romfs.img, msl.tar) to the manifest's file, fetched in this process.
+    func syncFile(_ p: GameDataManifest.Part, base: URL, name: String, accepts: (URL) -> Bool = { _ in true }) async throws {
+        let todo = try await prepare(p, base: base, name: name)
+        try await fetchForeground(p, base: base, name: name, todo: todo)
+        try finish(name, accepts: accepts)
     }
 
     /// Deletes the downloaded game data: the image, the shader libraries and any half-done download. The saves (games/<id>/save) stay.
     func deleteGameData() throws {
         let fm = FileManager.default
-        for n in ["romfs.img", "romfs.img.part", "romfs.img.part.json", "msl.tar", "msl.tar.part", "msl.tar.part.json", "msl", "msl.part", "msl.part.json", "temp"] {
+        for n in ["romfs.img", "romfs.img.part", "romfs.img.part.json", "romfs.img.part.plan.json", "msl.tar", "msl.tar.part", "msl.tar.part.json", "msl.tar.part.plan.json", "msl", "msl.part", "msl.part.json", "temp"] {
             let u = gameDir.appendingPathComponent(n)
             if fm.fileExists(atPath: u.path) { try fm.removeItem(at: u) }
         }

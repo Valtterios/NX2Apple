@@ -14,6 +14,7 @@ final class GameDataModel: ObservableObject {
     @Published var fraction = 0.0
     @Published var note = ""
     @Published var confirmDelete = false
+    @Published var background: Bool { didSet { UserDefaults.standard.set(background, forKey: "gamedata.background") } }   // GameDataBackground.swift: iOS keeps fetching while the app is away
     private var task: Task<Void, Never>?
     let gameDir = URL(fileURLWithPath: dm_game_dir())
 
@@ -21,12 +22,16 @@ final class GameDataModel: ObservableObject {
         let env = ProcessInfo.processInfo.environment
         server = UserDefaults.standard.string(forKey: "gamedata.server") ?? env["DM_DATA_SERVER"] ?? ""
         token = UserDefaults.standard.string(forKey: "gamedata.token") ?? env["DM_DATA_TOKEN"] ?? ""
+        background = UserDefaults.standard.object(forKey: "gamedata.background") as? Bool ?? true
         refresh()
+        // A download that was running when the app was left (or that iOS kept going in the background) continues as soon as the launcher shows
+        if hasPartial && !server.isEmpty { note = "Continuing the download…"; DispatchQueue.main.async { [weak self] in self?.start() } }
     }
 
     var expected: String? { dm_expected_romfs_identity() }
     var imagePath: String { gameDir.appendingPathComponent("romfs.img").path }
-    var hasPartial: Bool { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("romfs.img.part.json").path) || FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("msl.tar.part.json").path) }
+    var hasPartial: Bool { ["romfs.img.part.json", "msl.tar.part.json"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
+    static func identifier(_ title: String) -> String { "org.nxnative.gamedata." + title }   // one background session per game: two games in one LiveContainer do not share it
     var imageOK: Bool { dm_romfs_status(imagePath) == 0 }
     var hasAny: Bool { ["romfs.img", "romfs.img.part", "msl.tar", "msl.tar.part", "msl"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
 
@@ -69,11 +74,31 @@ final class GameDataModel: ObservableObject {
                     throw GameDataError.mismatch("The server has \(m.name ?? m.title) \(m.version) (\(m.build)), but this app was built for \(romfsIdentityField(w, "version") ?? "another version"): publish that version, or install the matching app.")
                 }
                 let ownShaders = Bundle.main.resourceURL.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("msl").appendingPathComponent(dm_shader_dir_name()).path) } ?? false
+                var files: [(GameDataManifest.Part, String)] = []
                 if let s = m.shaders, !ownShaders {   // an IPA that carries its shaders (the default build) does not fetch them again
                     if let d = s.dir, d != dm_shader_dir_name() { throw GameDataError.mismatch("The server's shaders are \(d), this app needs \(dm_shader_dir_name()): publish them from the same build as the app.") }
-                    try await sync.syncFile(s, base: base, name: "msl.tar")
+                    files.append((s, "msl.tar"))
                 }
-                try await sync.syncFile(m.romfs, base: base, name: "romfs.img") { dm_romfs_status($0.path) == 0 }
+                files.append((m.romfs, "romfs.img"))
+                let accepts: (String) -> (URL) -> Bool = { n in n == "romfs.img" ? { dm_romfs_status($0.path) == 0 } : { _ in true } }
+                var todo: [String: [Int]] = [:]
+                for (p, n) in files { todo[n] = try await sync.prepare(p, base: base, name: n) }
+                if self?.background == true {
+                    // Handed to iOS: it keeps fetching while the app is away; this loop only watches, and Pause cancels what is still queued
+                    let bg = GameDataBackground.shared(identifier: Self.identifier(m.title), sync: sync)
+                    bg.reset(); bg.pump(files.map { $0.1 })
+                    sync.progress.set(phase: "Downloading (continues in the background)")
+                    do {
+                        while !files.allSatisfy({ sync.complete($0.1) }) {
+                            if let e = bg.lastError { throw GameDataError.server(e) }
+                            try await Task.sleep(nanoseconds: 500_000_000)
+                            if bg.pending == 0 { bg.pump(files.map { $0.1 }) }   // nothing queued but pieces missing (a cancelled or given-up piece): queue again
+                        }
+                    } catch { if error is CancellationError { bg.cancelAll() }; throw error }
+                } else {
+                    for (p, n) in files { try await sync.fetchForeground(p, base: base, name: n, todo: todo[n] ?? []) }
+                }
+                for (_, n) in files { try sync.finish(n, accepts: accepts(n)) }
                 self?.finish("Done: \(m.name ?? "game data") \(m.version) is ready (from \(sync.using?.host ?? "the server")). Press Play.")
             } catch is CancellationError {
                 self?.finish("Paused. Download resumes where it stopped.")
@@ -129,6 +154,7 @@ struct GameDataServerSection: View {
             TextField("Server address(es): home first, then public, separated by spaces", text: $m.server, axis: .vertical)
                 .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled().disabled(m.running)
             SecureField("Access token (if the server asks for one)", text: $m.token).disabled(m.running)
+            Toggle("Keep downloading in the background", isOn: $m.background).disabled(m.running)
             Text(m.status).foregroundStyle(.secondary)
             if m.running {
                 ProgressView(value: m.fraction)
@@ -143,7 +169,18 @@ struct GameDataServerSection: View {
         } header: {
             Text("Game data server")
         } footer: {
-            Text(m.note.isEmpty ? "Downloads this game's files from your own server. Keep the app open while it runs; it resumes if interrupted. Deleting frees the space and keeps your saves." : m.note)
+            Text(m.note.isEmpty ? "Downloads this game's files from your own server. In the background, iOS keeps fetching while you use other apps (if it does not inside LiveContainer, turn it off and keep the app open). It resumes if interrupted. Deleting frees the space and keeps your saves." : m.note)
         }
     }
+}
+
+// main.m's app delegate: iOS relaunched the app in the background because a game data download has news; the session is made again to take it,
+// and the completion handler is called once it has (GameDataBackground.urlSessionDidFinishEvents)
+@_cdecl("dm_gamedata_background_events")
+public func dmGamedataBackgroundEvents(_ identifier: NSString, _ done: @escaping @convention(block) () -> Void) {
+    let id = identifier as String
+    guard id == GameDataModel.identifier(dm_game_title()) else { done(); return }
+    GameDataBackground.liveLockedSetDone(id, done)
+    let sync = GameDataSync(servers: [], token: UserDefaults.standard.string(forKey: "gamedata.token") ?? "", gameDir: URL(fileURLWithPath: dm_game_dir()))
+    _ = GameDataBackground.shared(identifier: id, sync: sync)
 }

@@ -283,6 +283,11 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
 - (UISceneConfiguration *)application:(UIApplication *)a configurationForConnectingSceneSession:(UISceneSession *)s options:(UISceneConnectionOptions *)o {
     return [[UISceneConfiguration alloc] initWithName:@"Default" sessionRole:s.role];
 }
+// A background game data download has finished pieces for the app (GameDataBackground.swift): hand them over, and tell iOS when they are taken
+- (void)application:(UIApplication *)a handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void (^)(void))done {
+    extern void dm_gamedata_background_events(NSString *, void (^)(void));
+    dm_gamedata_background_events(identifier, done);
+}
 @end
 
 // Scene lifecycle: create the window + hand focus events to front_ios.m
