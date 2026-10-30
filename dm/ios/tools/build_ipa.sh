@@ -200,7 +200,9 @@ fi
 if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
 # DM_SHADERS=separate (the NSP script's --shaders separate): the shader libraries stay out of the IPA, which shrinks from about 1.5 GB to about 100 MB; the app then takes them from
 # Documents/games/<title ID>/msl, where its game data download puts them (GameDataSync.swift, scripts/publish_gamedata.py)
-if [ "${DM_SHADERS:-bundle}" = separate ]; then t "shader libraries left out of the IPA (DM_SHADERS=separate): the app downloads them with the game data"; MAPS+=("$P=$APP")
+# Only the NVN chain libraries (b-<version>) can be read from the downloaded msl.tar (nvn_mtl.m); a Vulkan or OpenGL game's single library stays in the IPA
+if [ "${DM_SHADERS:-bundle}" = separate ] && [ "$GFXAPI" != nvn ]; then t "shader libraries stay in the IPA: DM_SHADERS=separate is for NVN games, this one is $GFXAPI"; fi
+if [ "${DM_SHADERS:-bundle}" = separate ] && [ "$GFXAPI" = nvn ]; then t "shader libraries left out of the IPA (DM_SHADERS=separate): the app downloads them with the game data"; MAPS+=("$P=$APP")
 else MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP"); fi
 t "pack IPA (already-compressed game files stored, everything else deflated)"
 # The pulling vertex libraries (<key>_bp, dm/gfx/tools/dmsh_pull.py) serve the hybrid pipelines. Default to the same pso_mtl4 setting compiled by gen_build.py; IOS_PULL=0 / 1 overrides it.

@@ -102,7 +102,10 @@ def main():
                     romfs=part(dest / 'romfs.img', f'{build}/romfs.img', identity=identity))
     if not a.no_shaders:
         libs = sorted(p for p in (work / 'shader' / 'ios').glob('b-*') if p.is_dir())   # not b-<version>.key, the cache key beside it
-        if not libs: sys.exit(f'no shader libraries in {work}/shader/ios (or pass --no-shaders)')
+        if not libs:   # a Vulkan or OpenGL game: its shaders are one library inside the IPA (build_ipa.sh), nothing to publish
+            if not (work / 'shader' / 'ios').exists(): sys.exit(f'no shader libraries in {work}/shader/ios (or pass --no-shaders)')
+            print('  shaders    none to publish: this game\'s shader library travels inside its IPA')
+    if not a.no_shaders and libs:
         tar = dest / 'msl.tar'
         # the same files the IPA carries: its own list when it has one (a default build), else build_ipa.sh's rule for the pulling-vertex libraries
         rel = lambda p: str(p.relative_to(libs[-1].parent))

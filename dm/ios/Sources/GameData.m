@@ -35,7 +35,7 @@ NSString *dm_shader_dir_name(void) { return @"b-" DMSH_CHAIN; }
 
 BOOL dm_have_shaders(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *own = [[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
+    NSString *own = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"msl"];   // the app's own: b-<version> for an NVN game, vk/ or gl/ for the others
     NSString *dl = [[dm_game_dir() stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
     NSString *tar = [dm_game_dir() stringByAppendingPathComponent:@"msl.tar"];   // read in place by the host (nvn_mtl.m msl_pack_open)
     return [fm fileExistsAtPath:own] || [fm fileExistsAtPath:dl] || [fm fileExistsAtPath:tar];
