@@ -191,8 +191,9 @@ if [ "${DM_COPY_ROMFS:-YES}" = NO ]; then
     MAPS=("$P/romfs.id=$O/romfs.id"); t "game files identity: $(cat "$O/romfs.id")"
   fi
 elif [ -f "$ROMFS" ]; then MAPS=("$P/romfs.img=$ROMFS"); else MAPS=("$P/romfs=$ROMFS"); fi
-# main.m finds add-on content only in the app (<App>/aoc), so a slim IPA still packs it while it is small (up to 64 MB: Mario Kart 8 Deluxe's Booster Course Pass is 4 KB, its tracks are in the update)
-if [ -n "$AOC" ] && [ -d "$AOC" ] && { [ "$DM_COPY_ROMFS" != NO ] || [ "$(du -sk "$AOC" | cut -f1)" -le 65536 ]; }; then
+# main.m finds add-on content only in the app (<App>/aoc), so a slim IPA still packs it while it is small (up to 64 MB: Mario Kart 8 Deluxe's Booster Course Pass is 4 KB, its tracks are in the update;
+# DM_AOC_MAX_MB raises the limit for a game whose DLC carries real content, such as Breath of the Wild's 1.4 GB Master Trials)
+if [ -n "$AOC" ] && [ -d "$AOC" ] && { [ "$DM_COPY_ROMFS" != NO ] || [ "$(du -sk "$AOC" | cut -f1)" -le $(( ${DM_AOC_MAX_MB:-64} * 1024 )) ]; }; then
   MAPS+=("$P/aoc=$AOC"); t "add-on content packed into the IPA: $(ls "$AOC" | tr '\n' ' ')"
 elif [ -n "$AOC" ] && [ -d "$AOC" ]; then
   t "add-on content alongside the game data (DM_FULL_ROMFS=1 packs it): $(ls "$AOC" | tr '\n' ' ')"
