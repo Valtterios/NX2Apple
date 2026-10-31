@@ -112,7 +112,7 @@ def main():
         keep = (lambda p: rel(p) in ipa_msl) if ipa_msl else (lambda p: a.with_pull_libs or not p.name.endswith('_bp.metallib'))
         print(f'  msl.tar    {libs[-1].name}, packing{" the IPA\'s " + str(len(ipa_msl)) + " files" if ipa_msl else ""}…'); ustar(libs[-1], tar, keep)
         manifest['shaders'] = part(tar, f'{build}/msl.tar', dir=libs[-1].name)
-        if tar.stat().st_size < 1 << 20: sys.exit(f'{tar} is almost empty: {libs[-1]} holds no shader libraries')
+        if not any(keep(p) and p.suffix == '.metallib' for p in libs[-1].iterdir()): sys.exit(f'{tar} is empty: {libs[-1]} holds no shader libraries')   # by count, not size: a game with few shaders packs to under 1 MB
         print(f'             {tar.stat().st_size / 1e9:.2f} GB')
     # manifest URLs are relative to the manifest: the per-build copy sits beside its files, the latest one a folder above
     (dest / 'manifest.json').write_text(json.dumps(dict(manifest, romfs=dict(manifest['romfs'], url='romfs.img'),
