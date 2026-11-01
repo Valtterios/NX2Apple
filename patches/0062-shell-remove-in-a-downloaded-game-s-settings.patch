@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:46:28 +0200
+Subject: [PATCH] Shell: Remove in a downloaded game's settings
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the shell's Remove in game settings (patch 0057)
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-upstream)
+
+---
+ dm/ios/Shell/ShellStore.swift | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index c5efb4b..6b92c9d 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -118,6 +118,8 @@ func untar(_ tar: URL, into dir: URL) throws {
+         // The server's games in the library itself: their state and primary action come from here
+         model.serverState = { [weak self] id, local in self?.state(id, local: local) }
+         model.onServerAction = { [weak self] id in self?.action(id) }
++        model.canRemove = { [weak self] id in self?.installedBuild(id) != nil }   // a game this app downloaded: Remove in its settings
++        model.onRemove = { [weak self] id in if let self, let g = self.game(id), self.busy == nil { self.remove(g) } }
+     }
+ 
+     func game(_ id: String) -> ShellCatalogue.Game? { catalogue?.games.first { $0.id == id } }
