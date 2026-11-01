@@ -685,7 +685,7 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         let ids = model.details.map(\.id)
         #expect(ids.first == Fixtures.orbit)
         let rank = model.details.map { d -> Int in
-            switch d.game.state { case .playable: 1; case .needsGameData: 2; case .needsAppUpdate: 3; case .broken: 4 }
+            switch d.game.state { case .playable: 1; case .needsGameData, .server: 2; case .needsAppUpdate: 3; case .broken: 4 }
         }
         #expect(rank == rank.sorted())
         let broken = model.details.filter { if case .broken = $0.game.state { true } else { false } }.map(\.game.title)

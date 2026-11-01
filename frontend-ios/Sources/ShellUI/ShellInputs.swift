@@ -10,6 +10,9 @@ public enum GameState: Equatable, Sendable {
     /// for the player (what happened, what to do), shown under the title and in the How to fix sheet. `technical`
     /// is the underlying message, shown only as small secondary Details in the sheet.
     case broken(reason: String, detail: String = "", technical: String = "")
+    /// A game the host gets from elsewhere (the shell's game server): its own status line, explanation, primary action and its
+    /// symbol, all localized by the host. The primary action calls `ShellActions.onServerAction`.
+    case server(status: String, detail: String, action: String, symbol: String)
 }
 
 public struct GameTile: Identifiable, Equatable, Sendable {
@@ -218,6 +221,7 @@ public struct ShellActions {
     public var onButtonTest: (Bool) -> Void
     /// Deletes the game's data on this device and takes it off the list. `saves`: its saves go too.
     public var onDeleteGame: (_ gameID: String, _ saves: Bool) -> Void
+    public var onServerAction: (String) -> Void
     public init(onSelect: @escaping (String) -> Void = { _ in }, onPlay: @escaping (String) -> Void = { _ in },
                 onChange: @escaping (String, String, String) -> Void = { _, _, _ in },
                 onPickGameData: @escaping (String) -> Void = { _ in }, onUseAppData: @escaping (String) -> Void = { _ in },
@@ -229,7 +233,9 @@ public struct ShellActions {
                 onClearShellCloud: @escaping () -> Void = {},
                 onGlobalPadMapChange: @escaping (String, String) -> Void = { _, _ in },
                 onGlobalPadMapReset: @escaping () -> Void = {}, onButtonTest: @escaping (Bool) -> Void = { _ in },
-                onDeleteGame: @escaping (String, Bool) -> Void = { _, _ in }) {
+                onDeleteGame: @escaping (String, Bool) -> Void = { _, _ in },
+                onServerAction: @escaping (String) -> Void = { _ in }) {
+        self.onServerAction = onServerAction
         self.onSelect = onSelect
         self.onPlay = onPlay
         self.onChange = onChange

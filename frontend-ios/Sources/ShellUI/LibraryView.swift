@@ -375,6 +375,7 @@ public struct LibraryView: View {
         case .needsGameData: actions.onPickGameData(detail.id)
         case .needsAppUpdate: actions.onAppUpdate()
         case .broken: actions.onShowLog(detail.id)
+        case .server: actions.onServerAction(detail.id)
         }
     }
     private func select(_ id: String) {
