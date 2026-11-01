@@ -88,6 +88,7 @@ struct PortraitLibrary: View, Equatable {
             .safeAreaInset(edge: .bottom, spacing: 0) { if !wide { bottomBar } }
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 10) {
+                    ExtraChip()
                     ControllerChip(count: controllers, action: openControllers)
                     ShellSettingsChip(action: openShellSettings)
                 }.padding(.top, 6).padding(.trailing, 16)
