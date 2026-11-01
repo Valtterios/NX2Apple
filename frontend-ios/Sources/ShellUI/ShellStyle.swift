@@ -461,6 +461,8 @@ extension GameState {
         case .server(_, _, let action, _): action
         }
     }
+    /// A game the host gets from elsewhere, not ready yet: its action (a download) is never started by tapping its card.
+    var isServer: Bool { if case .server = self { return true }; return false }
     /// Broken and needs-an-update are fixed on the Mac. Their primary action explains how, instead of acting.
     var needsHelp: Bool {
         switch self {
