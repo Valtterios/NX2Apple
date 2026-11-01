@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:43:58 +0200
+Subject: [PATCH] Shell: Remove in plain sight in Get games, with a
+ confirmation; it deletes the add-on content too
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the shell's Get games Remove (patch 0057)
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-upstream)
+
+---
+ dm/ios/Shell/ShellStore.swift | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index 0ad536b..c5efb4b 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -306,6 +306,7 @@ func untar(_ tar: URL, into dir: URL) throws {
+         try? FileManager.default.removeItem(at: frameworks.appendingPathComponent("DmGame\(g.id).framework"))
+         try? FileManager.default.removeItem(at: Self.kept.appendingPathComponent("DmGame\(g.id).framework"))
+         try? GameDataSync(servers: [], token: "", gameDir: gameDir(g.id)).deleteGameData()   // the saves stay
++        try? FileManager.default.removeItem(at: gameDir(g.id).appendingPathComponent("aoc"))   // its add-on content too
+         model.reload(); objectWillChange.send()
+     }
+ }
+@@ -321,6 +322,7 @@ enum ShellHostConfigPaths {
+ struct ShellStoreView: View {
+     @ObservedObject var store: ShellStore
+     @Environment(\.dismiss) private var dismiss
++    @State private var confirming: String?
+ 
+     var body: some View {
+         NavigationStack {
+@@ -370,7 +372,14 @@ struct ShellStoreView: View {
+                 }
+             }
+             if store.busy == g.id { Text(store.progress).font(.caption).foregroundStyle(.secondary) }
++            if have != nil && store.busy != g.id {   // in plain sight, not only as a swipe: what frees the space on the phone
++                Button(role: .destructive) { confirming = g.id } label: { Label("Remove from this phone (saves stay)", systemImage: "trash") }
++                    .font(.caption).buttonStyle(.borderless).disabled(store.busy != nil)
++            }
+         }
+         .swipeActions { if have != nil && store.busy == nil { Button("Remove", role: .destructive) { store.remove(g) } } }
++        .confirmationDialog("Remove \(g.name)?", isPresented: Binding(get: { confirming == g.id }, set: { if !$0 { confirming = nil } }), titleVisibility: .visible) {
++            Button("Remove", role: .destructive) { store.remove(g); confirming = nil }
++        } message: { Text("Its game code and data are deleted from this phone. Your saves stay, and you can download it again.") }
+     }
+ }
