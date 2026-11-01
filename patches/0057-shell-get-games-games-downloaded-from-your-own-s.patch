@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 20:38:49 +0200
+Subject: [PATCH] Shell: Get games, games downloaded from your own server
+ instead of embedded
+
+Get games (Shell/ShellStore.swift) lists the server's shell catalogue (scripts/publish_shell.py), downloads a game's framework into the
+app's own Frameworks folder and its romfs.img into Documents/games/<title ID>/ with the per-game app's resumable, checked download
+(GameDataSyncCore.swift). In LiveContainer the app's bundle is writable; iOS runs the new framework once LiveContainer's Force Sign has
+signed it, which the screen reads from the framework's code signature. build_shell.sh DM_SHELL_EMBED=0 builds the app with no game in it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: games for the one-app shell downloaded from a self-hosted server, signed by LiveContainer's Force Sign
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-upstream)
+
+---
+ dm/ios/Shell/ShellApp.swift   |  24 +++-
+ dm/ios/Shell/ShellStore.swift | 251 ++++++++++++++++++++++++++++++++++
+ dm/ios/project-shell.yml      |   1 +
+ dm/ios/tools/build_shell.sh   |   8 +-
+ scripts/publish_shell.py      |  55 ++++++++
+ 5 files changed, 335 insertions(+), 4 deletions(-)
+ create mode 100644 dm/ios/Shell/ShellStore.swift
+ create mode 100644 scripts/publish_shell.py
+
+diff --git a/dm/ios/Shell/ShellApp.swift b/dm/ios/Shell/ShellApp.swift
+index 8dbe45f..843b54f 100644
+--- a/dm/ios/Shell/ShellApp.swift
++++ b/dm/ios/Shell/ShellApp.swift
+@@ -66,8 +66,30 @@ private func withCStrings<R>(_ strings: [String], _ body: (UnsafePointer<UnsafeP
+             fputs("shell: DM_SHELL_PLAY=\(id) (\(state))\n", stderr)
+             DispatchQueue.main.async { model.play(id) }
+         }
+-        let host = UIHostingController(rootView: ShellHostView(model: model))
++        let store = ShellStore(chain: chain) { model.reload() }
++        let host = UIHostingController(rootView: ShellRoot(model: model, store: store))
+         host.view.backgroundColor = .black
+         return host
+     }
+ }
++
++/// The library with Get games over it (ShellStore.swift): games come from the game data server, not from the Mac.
++struct ShellRoot: View {
++    let model: ShellHostModel
++    @ObservedObject var store: ShellStore
++    @State private var getting = false
++
++    var body: some View {
++        ShellHostView(model: model)
++            .overlay(alignment: .topTrailing) {
++                Button { getting = true } label: {
++                    Label(store.needsSigning.isEmpty ? "Get games" : "Force Sign needed", systemImage: store.needsSigning.isEmpty ? "arrow.down.circle" : "exclamationmark.triangle")
++                        .font(.footnote.weight(.semibold))
++                }
++                .buttonStyle(.bordered).tint(store.needsSigning.isEmpty ? nil : .orange)
++                .padding(.trailing, 16).padding(.top, 4)
++            }
++            .sheet(isPresented: $getting, onDismiss: { model.reload() }) { ShellStoreView(store: store) }
++            .onAppear { if model.entries.isEmpty { getting = true } }
++    }
++}
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+new file mode 100644
+index 0000000..c704835
+--- /dev/null
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -0,0 +1,251 @@
++// The shell's games from the game data server (docs/game-data-server.md): Get games lists the server's shell catalogue
++// (<server>/shell/catalog.json, scripts/publish_shell.py), downloads a game's framework into the app's own Frameworks folder and its
++// game data into Documents/games/<title ID>/ (GameDataSyncCore.swift, the per-game app's download). In LiveContainer the app's bundle is
++// writable but iOS runs only signed code, so a downloaded framework needs LiveContainer's Force Sign once before it can be played; the
++// screen says when, by reading the framework's own code signature.
++import Foundation
++import SwiftUI
++
++struct ShellCatalogue: Decodable {
++    struct Game: Decodable, Identifiable {
++        let id: String
++        let name: String
++        let version: String
++        let build: String
++        let icon: String?
++        let framework: GameDataManifest.Part   // DmGame<id>.framework as an uncompressed ustar, chunk hashes as for the game data
++    }
++    let format: Int
++    let chain: String
++    let games: [Game]
++}
++
++enum FrameworkSignature { case missing, unsigned, adhoc, certificate }
++
++/// The code signature of a framework's executable: LiveContainer's Force Sign gives it a certificate signature (a CMS blob), a build
++/// from the Mac has none or an ad hoc one, which iOS refuses to load.
++func frameworkSignature(_ executable: URL) -> FrameworkSignature {
++    guard let h = try? FileHandle(forReadingFrom: executable) else { return .missing }
++    defer { try? h.close() }
++    guard let head = try? h.read(upToCount: 65536), head.count >= 32 else { return .unsigned }
++    func u32(_ d: Data, _ o: Int, big: Bool = false) -> UInt32 {
++        let v = d.subdata(in: o..<(o + 4)).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
++        return big ? UInt32(bigEndian: v) : UInt32(littleEndian: v)
++    }
++    guard u32(head, 0) == 0xfeedfacf else { return .unsigned }   // MH_MAGIC_64, a thin arm64 image as the framework build makes it
++    let ncmds = Int(u32(head, 16)); var off = 32
++    for _ in 0..<ncmds {
++        guard off + 16 <= head.count else { break }
++        let cmd = u32(head, off), size = Int(u32(head, off + 4))
++        if cmd == 0x1d {   // LC_CODE_SIGNATURE: the superblob's offset and size in the file
++            let at = UInt64(u32(head, off + 8)), len = Int(u32(head, off + 12))
++            guard (try? h.seek(toOffset: at)) != nil, let blob = try? h.read(upToCount: len), blob.count >= 12,
++                  u32(blob, 0, big: true) == 0xfade0cc0 else { return .unsigned }
++            let count = Int(u32(blob, 8, big: true))
++            for i in 0..<count where 12 + i * 8 + 8 <= blob.count {
++                let type = u32(blob, 12 + i * 8, big: true), at = Int(u32(blob, 16 + i * 8, big: true))
++                if type == 0x10000, at + 8 <= blob.count, u32(blob, at + 4, big: true) > 8 { return .certificate }   // CSSLOT_SIGNATURESLOT with a CMS inside
++            }
++            return .adhoc
++        }
++        off += max(size, 8)
++    }
++    return .unsigned
++}
++
++/// Unpacks an uncompressed ustar (files, folders, the name prefix field) into a folder; anything else in it is an error.
++func untar(_ tar: URL, into dir: URL) throws {
++    let fm = FileManager.default
++    let h = try FileHandle(forReadingFrom: tar); defer { try? h.close() }
++    func field(_ b: Data, _ o: Int, _ n: Int) -> String {
++        String(decoding: b.subdata(in: o..<(o + n)).prefix { $0 != 0 }, as: UTF8.self)
++    }
++    while let block = try h.read(upToCount: 512), block.count == 512 {
++        if block.allSatisfy({ $0 == 0 }) { break }
++        let name = field(block, 0, 100), prefix = field(block, 345, 155), type = block[156]
++        let size = Int(field(block, 124, 12).trimmingCharacters(in: .whitespaces), radix: 8) ?? 0
++        let path = prefix.isEmpty ? name : prefix + "/" + name
++        guard !path.split(separator: "/").contains("..") else { throw GameDataError.local("unsafe path \(path) in \(tar.lastPathComponent)") }
++        let dst = dir.appendingPathComponent(path)
++        switch type {
++        case 0x35:   // '5' folder
++            try fm.createDirectory(at: dst, withIntermediateDirectories: true)
++        case 0x30, 0:   // '0' file
++            try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
++            fm.createFile(atPath: dst.path, contents: nil)
++            let out = try FileHandle(forWritingTo: dst)
++            var left = size
++            while left > 0 {
++                guard let d = try h.read(upToCount: min(left, 4 << 20)), !d.isEmpty else { throw GameDataError.local("\(tar.lastPathComponent) ends early") }
++                try out.write(contentsOf: d); left -= d.count
++            }
++            try out.close()
++            let pad = (512 - size % 512) % 512
++            if pad > 0 { _ = try h.read(upToCount: pad) }
++        default:
++            throw GameDataError.local("\(tar.lastPathComponent): entry type \(type) of \(path) is not supported")
++        }
++    }
++}
++
++@MainActor final class ShellStore: ObservableObject {
++    @Published var server: String { didSet { UserDefaults.standard.set(server, forKey: "gamedata.server") } }
++    @Published var token: String { didSet { UserDefaults.standard.set(token, forKey: "gamedata.token") } }
++    @Published var catalogue: ShellCatalogue?
++    @Published var status = ""
++    @Published var busy: String?   // the title ID being installed
++    @Published var progress = ""
++    let chain: String?
++    let onChange: () -> Void
++
++    init(chain: String?, onChange: @escaping () -> Void) {
++        self.chain = chain; self.onChange = onChange
++        server = UserDefaults.standard.string(forKey: "gamedata.server") ?? "https://games.auraserver.eu/data"
++        token = UserDefaults.standard.string(forKey: "gamedata.token") ?? ""
++    }
++
++    var frameworks: URL { Bundle.main.privateFrameworksURL ?? Bundle.main.bundleURL.appendingPathComponent("Frameworks", isDirectory: true) }
++    func executable(_ id: String) -> URL { frameworks.appendingPathComponent("DmGame\(id).framework/DmGame\(id)") }
++    func gameDir(_ id: String) -> URL { ShellHostConfigPaths.appData.appendingPathComponent(id, isDirectory: true) }
++    var servers: [URL] { server.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" }).compactMap { URL(string: String($0)) } }
++    var bundleWritable: Bool { FileManager.default.isWritableFile(atPath: Bundle.main.bundlePath) }   // Frameworks/ may not exist yet: an app with no game built in
++
++    func installedBuild(_ id: String) -> String? {
++        let m = frameworks.appendingPathComponent("DmGame\(id).framework/shell-build.txt")
++        return (try? String(contentsOf: m, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++    var needsSigning: [String] {
++        (catalogue?.games ?? []).map(\.id).filter { installedBuild($0) != nil && frameworkSignature(executable($0)) != .certificate }
++    }
++
++    func load() async {
++        status = "Asking the server…"
++        do {
++            let sync = GameDataSync(servers: servers, token: token, gameDir: FileManager.default.temporaryDirectory)
++            var last = "no server address"
++            for s in servers {
++                let (data, resp) = try await URLSession.shared.data(for: sync.request(s.appendingPathComponent("shell/catalog.json")))
++                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
++                if code == 401 || code == 403 { throw GameDataError.server("The server refused access (HTTP \(code)): check the access token.") }
++                guard code == 200 else { last = "HTTP \(code) from \(s.host ?? "")"; continue }
++                catalogue = try JSONDecoder().decode(ShellCatalogue.self, from: data)
++                status = ""
++                return
++            }
++            throw GameDataError.server("No game list on the server (\(last)).")
++        } catch { status = error.localizedDescription }
++    }
++
++    func install(_ g: ShellCatalogue.Game) async {
++        busy = g.id; progress = "Starting"; defer { busy = nil; progress = "" }
++        do {
++            guard let base = servers.first?.appendingPathComponent("shell/catalog.json") else { throw GameDataError.local("No server address") }
++            if let c = chain, let cat = catalogue, cat.chain != c {
++                throw GameDataError.mismatch("The server's games are built for shader chain \(cat.chain) and this app for \(c): the app needs an update.")
++            }
++            guard bundleWritable else { throw GameDataError.local("This app cannot add games here: run it in LiveContainer, whose app folder is writable.") }
++            // 1. the framework, a tar fetched with the game data's resumable, checked download, unpacked over any older copy
++            let staging = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("shell-downloads/\(g.id)", isDirectory: true)
++            let fsync = GameDataSync(servers: servers, token: token, gameDir: staging)
++            let watch = Task { @MainActor in
++                while !Task.isCancelled {
++                    let p = fsync.progress
++                    progress = "Game code: \(p.phase) \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%"
++                    try? await Task.sleep(for: .milliseconds(500))
++                }
++            }
++            try await fsync.syncFile(g.framework, base: base, name: "framework.tar")
++            watch.cancel()
++            progress = "Unpacking"
++            let fw = frameworks.appendingPathComponent("DmGame\(g.id).framework")
++            try? FileManager.default.removeItem(at: fw)
++            try FileManager.default.createDirectory(at: frameworks, withIntermediateDirectories: true)
++            try untar(staging.appendingPathComponent("framework.tar"), into: frameworks)
++            try g.build.write(to: fw.appendingPathComponent("shell-build.txt"), atomically: true, encoding: .utf8)
++            try? FileManager.default.removeItem(at: staging)
++            // 2. the game data, as the per-game app downloads it (romfs.img only: the shader libraries are inside the framework)
++            let dsync = GameDataSync(servers: servers, token: token, gameDir: gameDir(g.id))
++            let (m, url) = try await dsync.manifest(title: g.id, build: g.build)
++            let watch2 = Task { @MainActor in
++                while !Task.isCancelled {
++                    let p = dsync.progress
++                    progress = "Game data: \(p.phase) \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%"
++                    try? await Task.sleep(for: .milliseconds(500))
++                }
++            }
++            try await dsync.syncFile(m.romfs, base: url, name: "romfs.img")
++            watch2.cancel()
++            onChange()
++            status = "\(g.name) is downloaded. Before playing it: open LiveContainer, open this app's settings and tap Force Sign, then start the app again."
++        } catch { status = "\(g.name): \(error.localizedDescription)" }
++    }
++
++    func remove(_ g: ShellCatalogue.Game) {
++        try? FileManager.default.removeItem(at: frameworks.appendingPathComponent("DmGame\(g.id).framework"))
++        try? GameDataSync(servers: [], token: "", gameDir: gameDir(g.id)).deleteGameData()   // the saves stay
++        onChange(); objectWillChange.send()
++    }
++}
++
++/// Where the shell keeps a game's data: ShellHostConfig.defaultAppDataRoot(), Documents/games/.
++enum ShellHostConfigPaths {
++    static var appData: URL {
++        (FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory)
++            .appendingPathComponent("games", isDirectory: true)
++    }
++}
++
++struct ShellStoreView: View {
++    @ObservedObject var store: ShellStore
++    @Environment(\.dismiss) private var dismiss
++
++    var body: some View {
++        NavigationStack {
++            List {
++                if !store.needsSigning.isEmpty {
++                    Section {
++                        Text("Force Sign needed for \(store.needsSigning.count == 1 ? "1 game" : "\(store.needsSigning.count) games"): in LiveContainer, open this app's settings, tap Force Sign, then start this app again. Needed once after each download.")
++                            .foregroundStyle(.orange)
++                    }
++                }
++                Section("Server") {
++                    TextField("Game data server", text: $store.server).textInputAutocapitalization(.never).autocorrectionDisabled()
++                    SecureField("Access token", text: $store.token)
++                    Button("Refresh the list") { Task { await store.load() } }.disabled(store.busy != nil)
++                }
++                if !store.status.isEmpty { Section { Text(store.status).font(.footnote) } }
++                if let games = store.catalogue?.games {
++                    Section("Games on the server") {
++                        ForEach(games) { g in row(g) }
++                    }
++                }
++            }
++            .navigationTitle("Get games")
++            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() }.disabled(store.busy != nil) } }
++            .task { if store.catalogue == nil && !store.token.isEmpty { await store.load() } }
++        }
++    }
++
++    @ViewBuilder func row(_ g: ShellCatalogue.Game) -> some View {
++        let have = store.installedBuild(g.id)
++        VStack(alignment: .leading, spacing: 4) {
++            HStack {
++                VStack(alignment: .leading) {
++                    Text(g.name)
++                    Text("\(g.version) · \(ByteCountFormatter.string(fromByteCount: g.framework.size, countStyle: .file)) of game code")
++                        .font(.caption).foregroundStyle(.secondary)
++                }
++                Spacer()
++                if store.busy == g.id { ProgressView() }
++                else if have == g.build {
++                    Text(frameworkSignature(store.executable(g.id)) == .certificate ? "Ready" : "Needs Force Sign")
++                        .font(.caption).foregroundStyle(frameworkSignature(store.executable(g.id)) == .certificate ? .green : .orange)
++                } else {
++                    Button(have == nil ? "Get" : "Update") { Task { await store.install(g) } }.buttonStyle(.borderedProminent).disabled(store.busy != nil)
++                }
++            }
++            if store.busy == g.id { Text(store.progress).font(.caption).foregroundStyle(.secondary) }
++        }
++        .swipeActions { if have != nil && store.busy == nil { Button("Remove", role: .destructive) { store.remove(g) } } }
++    }
++}
+diff --git a/dm/ios/project-shell.yml b/dm/ios/project-shell.yml
+index 2f92fc4..ad55eed 100644
+--- a/dm/ios/project-shell.yml
++++ b/dm/ios/project-shell.yml
+@@ -28,6 +28,7 @@ targets:
+       - path: Sources/CloudSaves.m
+       - path: Sources/SaveSync.m
+       - path: Sources/DataBookmark.m
++      - path: Sources/GameDataSyncCore.swift   # the game data download (patch 0056), for Get games (Shell/ShellStore.swift)
+       - path: Gen/dm          # the host's shared files (dm/font for DM_FONT_DIR); every game's tables are in its framework
+         type: folder
+         buildPhase: resources
+diff --git a/dm/ios/tools/build_shell.sh b/dm/ios/tools/build_shell.sh
+index d3cc308..772b791 100755
+--- a/dm/ios/tools/build_shell.sh
++++ b/dm/ios/tools/build_shell.sh
+@@ -16,6 +16,8 @@
+ #   DM_SHELL_PACKAGE     the frontend-ios Swift package (default: frontend-ios beside dm/ in this checkout)
+ #   DM_XCODE_DERIVED_DATA  derived data (default SHELL_DIR/dd); FONT_PY / STD_FONT as for build_ipa.sh
+ #   DM_GAMES_DIR         passed through, for a provisional game profile
++#   DM_SHELL_EMBED       0: embed no game, the frameworks only give the host its compiled defaults; the app downloads its games (Get games,
++#                        Shell/ShellStore.swift, from scripts/publish_shell.py's catalogue)
+ #   DM_ENTITLEMENTS      empty: no Increased Memory Limit request in the prepared project (default: requested, as build_ipa.sh does)
+ # The host is compiled from dm/host once, with the first framework's game profile as its compiled defaults (gen_build.py:
+ # game_profile.h). Every host site reads the runtime profile (dm_profile(), hle_profile.h), which the shell points at the chosen game's
+@@ -78,13 +80,13 @@ if [ "$MODE" = --prepare-xcode ] && [ -n "${DM_ENTITLEMENTS-default}" ]; then ec
+ elif [ "$MODE" = --prepare-xcode ]; then t "entitlements: none (DM_ENTITLEMENTS is empty): no Increased Memory Limit"; fi
+ # The template with one embedded, unlinked framework per game where it says @FRAMEWORKS@
+ python3 -I - "$IOS_SOURCE/project-shell.yml" "$FWLIST" project.yml <<'PY' || die "project.yml"
+-import sys
++import os, sys
+ template, fwlist, out = sys.argv[1:]
+ lines, done = [], False
+ for line in open(template, encoding='utf-8').read().splitlines():
+     if line.lstrip().startswith('# @FRAMEWORKS@'):
+         pad = line[:len(line) - len(line.lstrip())]
+-        for row in open(fwlist, encoding='utf-8').read().splitlines():
++        for row in ([] if os.environ.get('DM_SHELL_EMBED') == '0' else open(fwlist, encoding='utf-8').read().splitlines()):
+             path = row.split('\t')[1]
+             lines += [f'{pad}- framework: "{path}"', f'{pad}  embed: true', f'{pad}  link: false', f'{pad}  codeSign: true']
+         done = True
+@@ -111,7 +113,7 @@ xcodebuild -project DmShell.xcodeproj -scheme DmShell -configuration Release -de
+   || { grep -E 'error:' "$S/build.log" | head -20; die "xcodebuild, log $S/build.log"; }
+ APP=$DD/Build/Products/Release-iphoneos/DmShell.app
+ [ -x "$APP/DmShell" ] || die "no built app at $APP"
+-while IFS=$'\t' read -r tid path name; do
++[ "${DM_SHELL_EMBED:-1}" = 0 ] || while IFS=$'\t' read -r tid path name; do
+   fw=$APP/Frameworks/$(basename "$path"); [ -d "$fw" ] || die "the app does not embed $(basename "$path")"
+ done < "$FWLIST"
+ t "done: $APP ($(du -sh "$APP" | cut -f1)), unsigned"
+diff --git a/scripts/publish_shell.py b/scripts/publish_shell.py
+new file mode 100644
+index 0000000..d86699b
+--- /dev/null
++++ b/scripts/publish_shell.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""Publish games' shell frameworks to your game data server's folder, for the shell app's Get games (dm/ios/Shell/ShellStore.swift).
++
++    python3 scripts/publish_shell.py ~/Games/shell-fw/DmGame<title ID>.framework [...] --out /srv/games
++
++Each framework (build_ipa_from_nsp.py --shell-framework) is packed as an uncompressed ustar and listed in the catalogue, under --out:
++    data/shell/<title ID>/<chain>/DmGame<title ID>.framework.tar   the framework, as the app unpacks it into its own Frameworks folder
++    data/shell/<title ID>/icon.<ext>                               the game's icon
++    data/shell/catalog.json                                       every published game: name, version, build, the tar's size and chunk hashes
++The game's data comes from the game's own manifest, data/<title ID>/<build>/manifest.json (publish_gamedata.py, with --no-shaders when the
++game is only played in the shell: its shader libraries are in the framework). That manifest names the build and version listed here.
++"""
++import argparse, json, sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from publish_gamedata import part, ustar   # noqa: E402
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
++    ap.add_argument('frameworks', nargs='+', type=Path, help='DmGame<title ID>.framework folders')
++    ap.add_argument('--out', type=Path, required=True, help="the server's root folder (data/ goes in it)")
++    a = ap.parse_args()
++    shell = a.out / 'data' / 'shell'
++    cat_path = shell / 'catalog.json'
++    cat = json.loads(cat_path.read_text()) if cat_path.exists() else {'format': 1, 'chain': None, 'games': []}
++    for fw in a.frameworks:
++        fw = fw.expanduser().resolve()
++        m = json.loads((fw / 'game.manifest.json').read_text())
++        tid, chain = m['title_id'].upper(), m['chain']
++        if cat['chain'] not in (None, chain):
++            sys.exit(f'{fw.name}: built for shader chain {chain}, the catalogue holds {cat["chain"]}: build every game again with one engine')
++        cat['chain'] = chain
++        data = json.loads((a.out / 'data' / tid / 'manifest.json').read_text()) if (a.out / 'data' / tid / 'manifest.json').exists() else None
++        if not data: sys.exit(f'{fw.name}: no data/{tid}/manifest.json under {a.out}: publish the game data first (publish_gamedata.py --no-shaders)')
++        tar = shell / tid / chain / f'{fw.name}.tar'
++        tar.parent.mkdir(parents=True, exist_ok=True)
++        print(f'  {fw.name}: packing')
++        ustar(fw, tar)
++        icon = next((p for p in sorted(fw.glob('icon.*'))), None)
++        entry = dict(id=tid, name=data.get('name') or m.get('name') or tid, version=data['version'], build=data['build'],
++                     framework=part(tar, f'{tid}/{chain}/{tar.name}'))
++        if icon:
++            (shell / tid / icon.name).write_bytes(icon.read_bytes())
++            entry['icon'] = f'{tid}/{icon.name}'
++        cat['games'] = [g for g in cat['games'] if g['id'] != tid] + [entry]
++        print(f'  {fw.name}: {entry["framework"]["size"] / 1e9:.2f} GB, {entry["name"]} {entry["version"]} ({entry["build"]})')
++    cat['games'].sort(key=lambda g: g['name'].lower())
++    tmp = cat_path.with_suffix('.tmp'); tmp.write_text(json.dumps(cat, indent=1)); tmp.replace(cat_path)
++    print(f'  catalogue  {cat_path} ({len(cat["games"])} games)')
++
++
++if __name__ == '__main__':
++    main()
