@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 21:11:14 +0200
+Subject: [PATCH] Shell: add-on content from the server, beside the game data
+
+publish_shell.py --aoc puts a game's add-on content images on the server and in the catalogue; Get games downloads them into
+Documents/games/<title ID>/aoc/, where the launch finds them (DM_AOC_DIR), and counts a game ready only with all of them in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the shell's add-on content from the server (patch 0057)
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-upstream)
+
+---
+ dm/ios/Shell/ShellStore.swift | 19 +++++++++++++++++--
+ scripts/publish_shell.py      | 15 ++++++++++++++-
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index 8a7d075..0ad536b 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -17,6 +17,16 @@ struct ShellCatalogue: Decodable {
+         let build: String
+         let icon: String?
+         let framework: GameDataManifest.Part   // DmGame<id>.framework as an uncompressed ustar, chunk hashes as for the game data
++        let aoc: [AddOn]?                      // add-on content images, for Documents/games/<id>/aoc/ (EngineLaunchPlan's DM_AOC_DIR)
++    }
++    struct AddOn: Decodable {
++        let name: String
++        let part: GameDataManifest.Part
++        enum Key: String, CodingKey { case name }
++        init(from decoder: Decoder) throws {
++            name = try decoder.container(keyedBy: Key.self).decode(String.self, forKey: .name)
++            part = try GameDataManifest.Part(from: decoder)
++        }
+     }
+     let format: Int
+     let chain: String
+@@ -205,8 +215,9 @@ func untar(_ tar: URL, into dir: URL) throws {
+         let m = frameworks.appendingPathComponent("DmGame\(id).framework/game.manifest.json")
+         guard let d = try? Data(contentsOf: m), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               let line = j["romfs_identity"] as? String, let want = romfsIdentityField(line, "size").flatMap({ Int64($0) }) else { return false }
+-        let have = (try? FileManager.default.attributesOfItem(atPath: gameDir(id).appendingPathComponent("romfs.img").path)[.size] as? NSNumber)?.int64Value
+-        return have == want
++        func size(_ name: String) -> Int64? { (try? FileManager.default.attributesOfItem(atPath: gameDir(id).appendingPathComponent(name).path)[.size] as? NSNumber)?.int64Value }
++        guard size("romfs.img") == want else { return false }
++        return (game(id)?.aoc ?? []).allSatisfy { size("aoc/" + $0.name) == $0.part.size }
+     }
+     /// Downloaded completely (code and data) and not signed yet: what Force Sign is for
+     var needsSigning: [String] {
+@@ -267,6 +278,10 @@ func untar(_ tar: URL, into dir: URL) throws {
+                 }
+             }
+             try await dsync.syncFile(m.romfs, base: url, name: "romfs.img")
++            if let addOns = g.aoc, !addOns.isEmpty {   // the add-on content, from the shell catalogue, into games/<id>/aoc/
++                try FileManager.default.createDirectory(at: gameDir(g.id).appendingPathComponent("aoc"), withIntermediateDirectories: true)
++                for a in addOns { try await dsync.syncFile(a.part, base: base, name: "aoc/" + a.name) }
++            }
+             watch2.cancel()
+             // 3. both in: the framework goes into the app, over any older copy, and only now asks for Force Sign
+             if !codeCurrent {
+diff --git a/scripts/publish_shell.py b/scripts/publish_shell.py
+index d86699b..6eb8d0b 100644
+--- a/scripts/publish_shell.py
++++ b/scripts/publish_shell.py
+@@ -6,6 +6,8 @@
+ Each framework (build_ipa_from_nsp.py --shell-framework) is packed as an uncompressed ustar and listed in the catalogue, under --out:
+     data/shell/<title ID>/<chain>/DmGame<title ID>.framework.tar   the framework, as the app unpacks it into its own Frameworks folder
+     data/shell/<title ID>/icon.<ext>                               the game's icon
++    data/shell/<title ID>/aoc/<index>.img                          its add-on content (--aoc: the build's aoc/ folder), which the app puts
++                                                                   in Documents/games/<title ID>/aoc/ beside the game data
+     data/shell/catalog.json                                       every published game: name, version, build, the tar's size and chunk hashes
+ The game's data comes from the game's own manifest, data/<title ID>/<build>/manifest.json (publish_gamedata.py, with --no-shaders when the
+ game is only played in the shell: its shader libraries are in the framework). That manifest names the build and version listed here.
+@@ -14,13 +16,14 @@ import argparse, json, sys
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+-from publish_gamedata import part, ustar   # noqa: E402
++from publish_gamedata import part, place, ustar   # noqa: E402
+ 
+ 
+ def main():
+     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+     ap.add_argument('frameworks', nargs='+', type=Path, help='DmGame<title ID>.framework folders')
+     ap.add_argument('--out', type=Path, required=True, help="the server's root folder (data/ goes in it)")
++    ap.add_argument('--aoc', type=Path, help="the add-on content folder of the (single) framework's build: <title ID>_build/aoc")
+     a = ap.parse_args()
+     shell = a.out / 'data' / 'shell'
+     cat_path = shell / 'catalog.json'
+@@ -41,6 +44,16 @@ def main():
+         icon = next((p for p in sorted(fw.glob('icon.*'))), None)
+         entry = dict(id=tid, name=data.get('name') or m.get('name') or tid, version=data['version'], build=data['build'],
+                      framework=part(tar, f'{tid}/{chain}/{tar.name}'))
++        if a.aoc and a.aoc.is_dir() and len(a.frameworks) == 1:
++            imgs = sorted(a.aoc.glob('*.img'))
++            if imgs:
++                (shell / tid / 'aoc').mkdir(parents=True, exist_ok=True)
++                entry['aoc'] = []
++                for img in imgs:
++                    dst = shell / tid / 'aoc' / img.name
++                    place(img, dst, False)
++                    entry['aoc'].append(dict(name=img.name, **part(dst, f'{tid}/aoc/{img.name}')))
++                print(f'  {fw.name}: add-on content {", ".join(i.name for i in imgs)}')
+         if icon:
+             (shell / tid / icon.name).write_bytes(icon.read_bytes())
+             entry['icon'] = f'{tid}/{icon.name}'
