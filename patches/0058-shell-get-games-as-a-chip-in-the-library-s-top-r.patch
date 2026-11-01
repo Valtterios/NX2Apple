@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 20:44:37 +0200
+Subject: [PATCH] Shell: Get games as a chip in the library's top row, not over
+ it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the shell's Get games chip (patch 0057)
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-upstream)
+
+---
+ dm/ios/Shell/ShellApp.swift | 12 ++++--------
+ 1 file changed, 4 insertions(+), 8 deletions(-)
+
+diff --git a/dm/ios/Shell/ShellApp.swift b/dm/ios/Shell/ShellApp.swift
+index 843b54f..d1e7f6f 100644
+--- a/dm/ios/Shell/ShellApp.swift
++++ b/dm/ios/Shell/ShellApp.swift
+@@ -81,14 +81,10 @@ struct ShellRoot: View {
+ 
+     var body: some View {
+         ShellHostView(model: model)
+-            .overlay(alignment: .topTrailing) {
+-                Button { getting = true } label: {
+-                    Label(store.needsSigning.isEmpty ? "Get games" : "Force Sign needed", systemImage: store.needsSigning.isEmpty ? "arrow.down.circle" : "exclamationmark.triangle")
+-                        .font(.footnote.weight(.semibold))
+-                }
+-                .buttonStyle(.bordered).tint(store.needsSigning.isEmpty ? nil : .orange)
+-                .padding(.trailing, 16).padding(.top, 4)
+-            }
++            // In the library's top row, before Controllers and Settings (ShellUI's ShellExtraChip); orange while a download waits for Force Sign
++            .environment(\.shellExtraChip, ShellExtraChip(systemImage: store.needsSigning.isEmpty ? "arrow.down.circle" : "exclamationmark.triangle",
++                                                          label: store.needsSigning.isEmpty ? "Get games" : "Get games, Force Sign needed",
++                                                          attention: !store.needsSigning.isEmpty) { getting = true })
+             .sheet(isPresented: $getting, onDismiss: { model.reload() }) { ShellStoreView(store: store) }
+             .onAppear { if model.entries.isEmpty { getting = true } }
+     }

@@ -106,6 +106,7 @@ struct CoverFlowView: View, Equatable {
                 .accessibilityLabel(ShellStrings.text("Game settings") + ", " + selected.game.title)
                 .accessibilityIdentifier("settings.open")
                 .shellTarget("lib.settings", radius: 22, action: openSettings)
+            ExtraChip()
             ControllerChip(count: controllers, action: openControllers)
             ShellSettingsChip(action: openShellSettings)
         }
@@ -397,6 +398,35 @@ struct ControllerChip: View {
 }
 
 /// The gear at the top-right corner, which opens the shell's own settings.
+/// An app's own chip in the library's top row, before Controllers and Settings: the shell's Get games (its games come from a
+/// server, dm/ios/Shell/ShellStore.swift). Set with .environment(\.shellExtraChip, …); nil shows nothing.
+public struct ShellExtraChip {
+    public var systemImage: String
+    public var label: String
+    public var attention: Bool
+    public var action: () -> Void
+    public init(systemImage: String, label: String, attention: Bool = false, action: @escaping () -> Void) {
+        self.systemImage = systemImage; self.label = label; self.attention = attention; self.action = action
+    }
+}
+
+extension EnvironmentValues {
+    @Entry public var shellExtraChip: ShellExtraChip?
+}
+
+struct ExtraChip: View {
+    @Environment(\.shellExtraChip) private var chip
+    var body: some View {
+        if let chip {
+            Button(action: chip.action) { Image(systemName: chip.systemImage).frame(minWidth: 18).foregroundStyle(chip.attention ? .orange : .white) }
+                .buttonStyle(ChipButtonStyle())
+                .accessibilityLabel(chip.label)
+                .accessibilityIdentifier("shellExtra.open")
+                .shellTarget("lib.shellExtra", radius: 22, action: chip.action)
+        }
+    }
+}
+
 struct ShellSettingsChip: View {
     let action: () -> Void
     var body: some View {

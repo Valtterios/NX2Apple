@@ -94,6 +94,7 @@ public struct LibraryView: View {
                     EmptyLibraryView()
                         .overlay(alignment: .topTrailing) {
                             HStack(spacing: 10) {
+                                ExtraChip()
                                 ControllerChip(count: controllers.count, action: openControllers)
                                 ShellSettingsChip(action: openShellSettings)
                             }.padding(.top, 6).padding(.trailing, 16)
