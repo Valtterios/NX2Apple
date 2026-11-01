@@ -191,7 +191,8 @@ struct CoverFlowView: View, Equatable {
             // comes to the middle and never starts anything.
             if longPressed { longPressed = false; return }
             if chosen {
-                if settled { primary(detail) }
+                // A game from the server that is not ready only gets selected: a download (gigabytes) starts from its own button
+                if settled, !detail.game.state.isServer { primary(detail) }
                 return
             }
             withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) { centredID = detail.id }
@@ -212,7 +213,7 @@ struct CoverFlowView: View, Equatable {
         .shellTarget("lib.tile.\(detail.id)", radius: cover * 0.03) { primary(detail) }
         .accessibilityLabel(detail.game.title + ", " + detail.game.state.title)
         .accessibilityAddTraits(chosen ? .isSelected : [])
-        .accessibilityHint(chosen ? detail.game.state.actionTitle : ShellStrings.text("Double-tap to select"))
+        .accessibilityHint(chosen && !detail.game.state.isServer ? detail.game.state.actionTitle : ShellStrings.text("Double-tap to select"))
         .accessibilityIdentifier("tile.\(detail.id)")
     }
 
