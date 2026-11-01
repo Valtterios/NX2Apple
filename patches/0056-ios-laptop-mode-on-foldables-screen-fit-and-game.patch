@@ -1,0 +1,1563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:21:29 +0200
+Subject: [PATCH] iOS: laptop mode on foldables, screen fit, and game data from
+ your own server
+
+The per-game iPhone app splits the screen at the hinge of a half-folded foldable (UIHinge, iOS 27.1: the game
+upright, the pad flat) and fits the picture by DM_SCREEN_FIT (fit, zoom, stretch). Its game data (romfs.img and the
+shader libraries, read in place from msl.tar) downloads in the background from a server of the player's own,
+published by scripts/publish_gamedata.py (data/<title>/<build>/, the IPA and an AltStore source.json). A slim IPA
+packs add-on content up to DM_AOC_MAX_MB (64 MB by default).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the Duo's laptop mode and a self-hosted game data server for the per-game iPhone app
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-laptop-mode)
+
+---
+ dm/games/settings.tsv                    |   1 +
+ dm/gfx/nvn/nvn_mtl.m                     |  59 +++++-
+ dm/ios/Sources/DmIOS-Bridging-Header.h   |   1 +
+ dm/ios/Sources/GameData.h                |  27 +++
+ dm/ios/Sources/GameData.m                |  42 ++++
+ dm/ios/Sources/GameDataBackground.swift  | 131 ++++++++++++
+ dm/ios/Sources/GameDataSync.swift        | 200 +++++++++++++++++
+ dm/ios/Sources/GameDataSyncCore.swift    | 259 +++++++++++++++++++++++
+ dm/ios/Sources/Launcher.swift            | 119 +++++++----
+ dm/ios/Sources/front_ios.m               |  55 ++++-
+ dm/ios/Sources/main.m                    |  29 ++-
+ dm/ios/project.yml                       |   5 +-
+ dm/ios/tools/build_ipa.sh                |  13 +-
+ dm/tools/tests/test_launcher_settings.py |   6 +-
+ docs/game-data-server.md                 |  46 ++++
+ docs/settings.md                         |  15 +-
+ scripts/build_ipa_from_nsp.py            |   2 +
+ scripts/publish_gamedata.py              | 146 +++++++++++++
+ 18 files changed, 1088 insertions(+), 68 deletions(-)
+ create mode 100644 dm/ios/Sources/GameData.h
+ create mode 100644 dm/ios/Sources/GameData.m
+ create mode 100644 dm/ios/Sources/GameDataBackground.swift
+ create mode 100644 dm/ios/Sources/GameDataSync.swift
+ create mode 100644 dm/ios/Sources/GameDataSyncCore.swift
+ create mode 100644 docs/game-data-server.md
+ create mode 100644 scripts/publish_gamedata.py
+
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+index 00e1ddd..8a3042d 100644
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -22,6 +22,7 @@ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+ DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
+ DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	platform:ios	Game	Frame-rate counter
++DM_SCREEN_FIT	choice	fit=Fit (16:9),zoom=Fill (crop edges),stretch=Fill (stretch)	fit	platform:ios	Game	Screen fit	Fill removes the black bars on screens that are not 16:9: crop cuts off the edges, stretch distorts the picture.	level=basic
+ DM_TOUCH_HAPTICS	toggle	-	1	platform:ios	Controls	Touch feedback
+ DM_RUMBLE	toggle	-	1	always	Controls	Game rumble		level=basic
+ DM_RUMBLE_GAIN	range	0:3:0.1	1.0	always	Controls	Rumble strength		needs=DM_RUMBLE=1
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 4ccb061..4281e93 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -3663,6 +3663,45 @@ static os_unfair_lock g_rmu = OS_UNFAIR_LOCK_INIT;
+ // ---------- Shader mapping table: Switch control section hash → PC metallib (produced by dm/gfx/tools/shader_map.py) ----------
+ static NSMutableDictionary<NSString *, NSString *> *g_shmap;
+ static NSString *g_shmap_path, *g_msl_dir;
++// Shader archive: <DM_MSL_DIR>.tar, an uncompressed ustar of b-<version>/ (what the iOS game data download keeps, scripts/publish_gamedata.py), read in place when the
++// library directory itself is not there. shmap_load indexes its members once (name below b-<version>/ → data offset and size); lib_from_file maps a library straight
++// from the archive and msl_data reads a side file, so a game runs from one file as it does from the loose folder, without the folder's tens of thousands of files
++static int g_msl_pack_fd = -1;
++static NSDictionary<NSString *, NSValue *> *g_msl_pack;
++typedef struct { off_t off; size_t len; } msl_member;
++static int msl_pack_open(NSString *tar, NSString *top) {
++    int fd = open(tar.fileSystemRepresentation, O_RDONLY); if (fd < 0) return 0;
++    NSMutableDictionary *idx = [NSMutableDictionary dictionary]; NSString *pre = [top stringByAppendingString:@"/"];
++    struct stat st; fstat(fd, &st);
++    uint8_t h[512]; off_t at = 0;
++    while (at + 512 <= st.st_size && pread(fd, h, 512, at) == 512) {
++        int zero = 1; for (int i = 0; i < 512 && zero; i++) zero = !h[i];
++        if (zero) break;   // the end-of-archive blocks
++        char sz[13] = {0}; memcpy(sz, h + 124, 12); char *end; long long size = strtoll(sz, &end, 8);
++        if (end == sz || size < 0) { MLOG("[RED] shader archive %s: an unreadable header at %lld", tar.UTF8String, (long long)at); close(fd); return 0; }
++        char name[256] = {0}; size_t pl = strnlen((char *)h + 345, 155), nl = strnlen((char *)h, 100);
++        if (pl) { memcpy(name, h + 345, pl); name[pl] = '/'; memcpy(name + pl + 1, h, nl); } else memcpy(name, h, nl);
++        NSString *n = @(name);
++        if ((h[156] == '0' || h[156] == 0) && [n hasPrefix:pre])
++            idx[[n substringFromIndex:pre.length]] = [NSValue valueWithBytes:&(msl_member){at + 512, (size_t)size} objCType:@encode(msl_member)];
++        at += 512 + ((size + 511) & ~511LL);
++    }
++    if (!idx.count) { MLOG("[RED] shader archive %s has no files under %s/", tar.UTF8String, top.UTF8String); close(fd); return 0; }
++    g_msl_pack_fd = fd; g_msl_pack = idx;
++    MLOG("shader libraries read from the archive %s: %lu files, no unpacked folder", tar.UTF8String, (unsigned long)idx.count);
++    return 1;
++}
++static int msl_pack_find(NSString *path, msl_member *m) {   // a path under g_msl_dir, looked up in the archive
++    if (!g_msl_pack || ![path hasPrefix:g_msl_dir] || path.length <= g_msl_dir.length + 1) return 0;
++    NSValue *v = g_msl_pack[[path substringFromIndex:g_msl_dir.length + 1]]; if (!v) return 0;
++    [v getValue:m size:sizeof *m]; return 1;
++}
++static NSData *msl_data(NSString *path) {   // a side file (reflection .json, the stamp) from the folder or the archive
++    msl_member m;
++    if (!msl_pack_find(path, &m)) return [NSData dataWithContentsOfFile:path];
++    NSMutableData *d = [NSMutableData dataWithLength:m.len];
++    return pread(g_msl_pack_fd, d.mutableBytes, m.len, m.off) == (ssize_t)m.len ? d : nil;
++}
+ static NSString *exe_rel(const char *rel) {
+     char buf[4096]; uint32_t n = sizeof buf;
+     if (_NSGetExecutablePath(buf, &n)) return nil;
+@@ -3686,10 +3725,13 @@ static void shmap_load(void) {
+     const char *m = getenv("DM_MSL_DIR");
+     // Library directory = <DM_MSL_DIR or default cache>/b-<translation chain version>: the version comes from dm/gfx/nvn/dmsh_chain.h (tools/dmsh_chain.py), one for every game; a host built from an old source tree only accepts libraries of the old version
+     g_msl_dir = [NSString stringWithFormat:@"%@/b-%s", m ? @(m) : [NSString stringWithFormat:@"%s%s/build/cache/metal_shader_cache", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work"], DMSH_CHAIN];
+-    if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir]) MLOG("[RED] shader library directory %s does not exist: translation chain version %s of this source tree has not been built yet (dm/gfx/tools/dmsh_build.py)", g_msl_dir.UTF8String, DMSH_CHAIN);
++    NSString *tar = m ? [@(m) stringByAppendingString:@".tar"] : nil;   // no folder: the archive beside where it would be
++    if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir] && !(tar && [NSFileManager.defaultManager fileExistsAtPath:tar] && msl_pack_open(tar, g_msl_dir.lastPathComponent)))
++        MLOG("[RED] shader library directory %s does not exist: translation chain version %s of this source tree has not been built yet (dm/gfx/tools/dmsh_build.py)", g_msl_dir.UTF8String, DMSH_CHAIN);
+     // The library's stamp (inputs.tsv, written by a full dmsh_build.py run): the game and the digest of the profile inputs it was built from. The chain version is the same for every
+     // game and every state of a profile's tables, so the stamp is what ties c1_full.tsv / cb_extent.tsv to these libraries: each names the inputs of the library it was made from
+-    NSString *stamp = [NSString stringWithContentsOfFile:[g_msl_dir stringByAppendingPathComponent:@"inputs.tsv"] encoding:NSUTF8StringEncoding error:nil], *st_game = nil, *st_inputs = nil;
++    NSData *stamp_d = msl_data([g_msl_dir stringByAppendingPathComponent:@"inputs.tsv"]);
++    NSString *stamp = stamp_d ? [[NSString alloc] initWithData:stamp_d encoding:NSUTF8StringEncoding] : nil, *st_game = nil, *st_inputs = nil;
+     for (NSString *ln in [stamp componentsSeparatedByString:@"\n"]) {
+         NSArray *c = [ln componentsSeparatedByString:@"\t"];
+         if (c.count == 2 && [c[0] isEqual:@"game"]) st_game = c[1]; else if (c.count == 2 && [c[0] isEqual:@"inputs"]) st_inputs = c[1];
+@@ -3844,6 +3886,15 @@ static void pso_user_record(const char *fmt, ...) {
+ // while the default soft limit of an iOS process is 256; new shaders created in other acts raise it further). Here the file is mapped into memory and closed immediately, and the library is built from the in-memory data; the mapping is released when the library's data object is freed
+ static __thread int t_lib_layer;
+ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
++    msl_member pm;
++    if (msl_pack_find(path, &pm)) {   // in the shader archive: the member's pages, mapped from the page boundary before it
++        off_t base = pm.off & ~(off_t)(getpagesize() - 1); size_t skip = (size_t)(pm.off - base), mlen = pm.len + skip;
++        uint8_t *mm = mmap(NULL, mlen, PROT_READ, MAP_PRIVATE, g_msl_pack_fd, base);
++        if (mm == MAP_FAILED) { if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"mmap failed %@ (archive)", path]}]; return nil; }
++        t_lib_layer = memmem(mm + skip, pm.len, "render_target_array_index", 25) != NULL;
++        dispatch_data_t d = dispatch_data_create(mm + skip, pm.len, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(mm, mlen); });
++        return [g_dev newLibraryWithData:d error:err];
++    }
+     int fd = open(path.fileSystemRepresentation, O_RDONLY); struct stat st;
+     if (fd < 0 || fstat(fd, &st) || st.st_size <= 0) { if (fd >= 0) close(fd); if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"cannot open %@", path]}]; return nil; }
+     size_t len = (size_t)st.st_size; void *m = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0); close(fd);
+@@ -3927,7 +3978,7 @@ static id<MTLFunction> fn_dev(id<MTLFunction> f) {
+ // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
+ static NvShader *shader_load(NSString *pc, int stage, int layer) {
+     NSError *e = nil;
+-    NSData *jd = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]];
++    NSData *jd = msl_data([NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]);
+     NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+     if (j && stage == 2 && [j[@"gs_slice"] isKindOfClass:[NSDictionary class]] && [j[@"chain"] isEqual:@DMSH_CHAIN]) {   // a slice-writing geometry shader has no library: a stub prog_fold_gs replaces
+         NvShader *o = [NvShader new]; o->stage = 2; o->lay_loc = -1; strlcpy(o->key, pc.UTF8String, sizeof o->key);
+@@ -6295,7 +6346,7 @@ static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   //
+     if (!f.functionConstantsDictionary.count) return ld;
+     MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = [MTLFunctionConstantValues new]; return sd;
+ }
+-static NSDictionary *pre_json(NSString *key) { NSData *d = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]]; return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }
++static NSDictionary *pre_json(NSString *key) { NSData *d = msl_data([NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]); return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }
+ // The base of one pair as the draws make it (pso_desc_pull / pso_desc), or nil when the pair is left to the draws. Call inside an autorelease pool
+ static MTL4RenderPipelineDescriptor *pre_desc(NSString *vk, NSString *fk, int zero) {
+     NSDictionary *vj = pre_json(vk), *fj = pre_json(fk);
+diff --git a/dm/ios/Sources/DmIOS-Bridging-Header.h b/dm/ios/Sources/DmIOS-Bridging-Header.h
+index 710e59a..47b37c5 100644
+--- a/dm/ios/Sources/DmIOS-Bridging-Header.h
++++ b/dm/ios/Sources/DmIOS-Bridging-Header.h
+@@ -2,6 +2,7 @@
+ // hands out (see DataBookmark.h). project.yml points SWIFT_OBJC_BRIDGING_HEADER here.
+ #import "CloudSaves.h"
+ #import "DataBookmark.h"
++#import "GameData.h"
+ 
+ // main.m: set when the game data found is an old shard archive (romfs.idx), which is no longer read. The sentence names the
+ // action (re-send the game data as romfs.img from the launcher), or NULL. The launcher's Game data section shows it.
+diff --git a/dm/ios/Sources/GameData.h b/dm/ios/Sources/GameData.h
+new file mode 100644
+index 0000000..3c18339
+--- /dev/null
++++ b/dm/ios/Sources/GameData.h
+@@ -0,0 +1,27 @@
++// What the game data download (GameDataSync.swift) needs to know about this build, from the C side.
++//
++// The downloader puts a game's data into the per-game layout main.m already reads,
++// Documents/games/<title ID>/{romfs.img, msl/}, and checks the image against the identity the build
++// carries (<App>/romfs.id, dm/host/romfs_identity.h): the same check main.m makes before it uses an
++// image, so a download is complete exactly when the game would accept it.
++
++#import <Foundation/Foundation.h>
++
++/// The game's title ID (the runtime profile's), e.g. 0100F2C0115B6000.
++NSString *dm_game_title(void);
++
++/// Documents/games/<title ID>: where downloaded game data goes (main.m game_dir_for).
++NSString *dm_game_dir(void);
++
++/// The identity line of the image this build needs (<App>/romfs.id), or nil for a build that takes any image.
++NSString *dm_expected_romfs_identity(void);
++
++/// How the image at path compares with this build's identity: 0 matches (or the build takes any complete image),
++/// 1 missing, 2 cut off or not an image, 3 another version, -1 the build's own identity cannot be read.
++int dm_romfs_status(NSString *path);
++
++/// The shader library folder this build loads ("b-<translation chain version>", dm/gfx/nvn/dmsh_chain.h).
++NSString *dm_shader_dir_name(void);
++
++/// YES when the app has shader libraries to run with: its own <App>/msl, or a downloaded games/<title ID>/msl.tar (or an unpacked msl/b-<version>).
++BOOL dm_have_shaders(void);
+diff --git a/dm/ios/Sources/GameData.m b/dm/ios/Sources/GameData.m
+new file mode 100644
+index 0000000..81b9cd6
+--- /dev/null
++++ b/dm/ios/Sources/GameData.m
+@@ -0,0 +1,42 @@
++// The C side of the game data download (GameData.h).
++#import "GameData.h"
++#include "hle_profile.h"
++#include "romfs_identity.h"
++#include "../../gfx/nvn/dmsh_chain.h"   // DMSH_CHAIN, the version the host's shader loader looks for (nvn_mtl.m shmap_load)
++
++NSString *dm_game_title(void) { return @(dm_profile()->id); }
++
++NSString *dm_game_dir(void) {
++    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
++    return [[doc stringByAppendingPathComponent:@"games"] stringByAppendingPathComponent:dm_game_title()];
++}
++
++static NSString *bundle_romfs_id(void) { return [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs.id"]; }
++
++NSString *dm_expected_romfs_identity(void) {
++    NSString *s = [NSString stringWithContentsOfFile:bundle_romfs_id() encoding:NSUTF8StringEncoding error:nil];
++    s = [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++    return s.length ? s : nil;
++}
++
++int dm_romfs_status(NSString *path) {
++    romfs_id want, got;
++    switch (romfs_id_check(bundle_romfs_id().fileSystemRepresentation, path.fileSystemRepresentation, &want, &got)) {
++    case ROMFS_ID_OK: return 0;
++    case ROMFS_ID_NONE: { romfs_id any; return romfs_id_of_image(path.fileSystemRepresentation, &any) ? 0 : (errno == ENOENT ? 1 : 2); }
++    case ROMFS_ID_MISSING: return 1;
++    case ROMFS_ID_UNREADABLE: return 2;
++    case ROMFS_ID_DIFFERENT: return 3;
++    default: return -1;
++    }
++}
++
++NSString *dm_shader_dir_name(void) { return @"b-" DMSH_CHAIN; }
++
++BOOL dm_have_shaders(void) {
++    NSFileManager *fm = NSFileManager.defaultManager;
++    NSString *own = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"msl"];   // the app's own: b-<version> for an NVN game, vk/ or gl/ for the others
++    NSString *dl = [[dm_game_dir() stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
++    NSString *tar = [dm_game_dir() stringByAppendingPathComponent:@"msl.tar"];   // read in place by the host (nvn_mtl.m msl_pack_open)
++    return [fm fileExistsAtPath:own] || [fm fileExistsAtPath:dl] || [fm fileExistsAtPath:tar];
++}
+diff --git a/dm/ios/Sources/GameDataBackground.swift b/dm/ios/Sources/GameDataBackground.swift
+new file mode 100644
+index 0000000..7207795
+--- /dev/null
++++ b/dm/ios/Sources/GameDataBackground.swift
+@@ -0,0 +1,131 @@
++// Game data download in the background: the pieces GameDataSync.prepare() left to fetch are handed to iOS's own download service (a background URLSession),
++// which keeps fetching while the app is in the background or not running. Each finished piece comes back here, in this launch or a later one: it is checked
++// against the manifest's SHA-256, written in place into <name>.part and recorded in <name>.part.json, exactly as the foreground mode does (GameDataSyncCore.swift).
++// Only a window of pieces is queued at a time (iOS keeps a finished piece as a file until the app takes it, so queueing all of a 17 GB game would need the space
++// twice); the next ones are queued as pieces come back. Inside LiveContainer the session belongs to LiveContainer's process: whether iOS keeps it going there
++// has to be seen on the device, and the foreground mode stays available either way.
++// Foundation and CryptoKit only, so the same file builds into the Mac test (with an ordinary session in place of the background one).
++import Foundation
++import CryptoKit
++
++final class GameDataBackground: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
++    static let window = 64                         // pieces queued at once: 1 GB, the most iOS holds for the app while it is away
++    private static var live: [String: GameDataBackground] = [:]   // one per session identifier and process: iOS allows no second session with the same identifier
++    private static let liveLock = NSLock()
++    private static var eventsDone: [String: () -> Void] = [:]   // the app delegate's completion handler for a relaunch in the background (main.m)
++    static func liveLockedSetDone(_ id: String, _ h: @escaping () -> Void) { liveLock.withLock { eventsDone[id] = h } }
++
++    let identifier: String
++    private(set) var sync: GameDataSync   // the latest start's: its token and progress counters
++    private var session: URLSession!
++    private let q = DispatchQueue(label: "gamedata.background")   // plans, states and the part files are touched on this queue only
++    private var plans: [String: GameDataSync.FilePlan] = [:]
++    private var states: [String: GameDataSync.FileState] = [:]
++    private var queued = Set<String>()             // "<name>#<piece>" handed to iOS and not back yet
++    private var retries: [String: Int] = [:]
++    private(set) var lastError: String?
++    var onProgress: (() -> Void)?
++
++    /// The session for this game, made once per process. config: nil = a background session (the app); the Mac test passes an ordinary one.
++    static func shared(identifier: String, sync: GameDataSync, config: URLSessionConfiguration? = nil) -> GameDataBackground {
++        liveLock.withLock {
++            if let b = live[identifier] { b.q.sync { b.sync = sync }; return b }
++            let b = GameDataBackground(identifier: identifier, sync: sync, config: config)
++            live[identifier] = b; return b
++        }
++    }
++
++    private init(identifier: String, sync: GameDataSync, config: URLSessionConfiguration?) {
++        self.identifier = identifier; self.sync = sync
++        super.init()
++        let c = config ?? URLSessionConfiguration.background(withIdentifier: identifier)
++        if config == nil { c.isDiscretionary = false; c.sessionSendsLaunchEvents = true }
++        c.httpMaximumConnectionsPerHost = GameDataSync.chunkParallel
++        c.requestCachePolicy = .reloadIgnoringLocalCacheData; c.urlCache = nil
++        let dq = OperationQueue(); dq.maxConcurrentOperationCount = 1
++        session = URLSession(configuration: c, delegate: self, delegateQueue: dq)
++        // Pieces still with iOS from an earlier launch count as queued; any it already finished are delivered to the delegate below
++        session.getAllTasks { [self] ts in q.sync { for t in ts { if let d = t.taskDescription { queued.insert(d) } } } }
++    }
++
++    private func load(_ name: String) -> Bool {
++        if plans[name] != nil && states[name] != nil { return true }
++        guard let p = try? JSONDecoder().decode(GameDataSync.FilePlan.self, from: Data(contentsOf: sync.planURL(name))),
++              let s = try? JSONDecoder().decode(GameDataSync.FileState.self, from: Data(contentsOf: sync.stateURL(name))), s.identity == p.identity else { return false }
++        plans[name] = p; states[name] = s; return true
++    }
++
++    /// Queues the next pieces of these files (the shader archive first, then the image), up to the window.
++    func pump(_ names: [String]) {
++        q.async { [self] in
++            for name in names where load(name) {
++                let p = plans[name]!, s = states[name]!
++                for i in s.done.indices where !s.done[i] {
++                    if queued.count >= Self.window { return }
++                    let d = "\(name)#\(i)"
++                    if queued.contains(d) || (retries[d] ?? 0) > 6 { continue }   // given up on: lastError says so, and Download starts it again
++                    let lo = Int64(i) * p.chunkSize, r = lo ..< min(lo + p.chunkSize, p.size)
++                    let t = session.downloadTask(with: sync.request(p.url, range: r))
++                    t.taskDescription = d; t.countOfBytesClientExpectsToReceive = r.len
++                    queued.insert(d); t.resume()
++                }
++            }
++        }
++    }
++
++    /// A new start: forget earlier failures (and errors), so every missing piece is tried again.
++    func reset() { q.sync { retries.removeAll(); lastError = nil; plans.removeAll(); states.removeAll() } }
++
++    /// Pause: everything still queued is cancelled; the pieces already in place stay.
++    func cancelAll() {
++        session.getAllTasks { [self] ts in ts.forEach { $0.cancel() }; q.async { self.queued.removeAll() } }
++    }
++
++    var pending: Int { q.sync { queued.count } }
++
++    // MARK: URLSessionDownloadDelegate
++
++    func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
++        // The file at location is gone when this returns: it is read, checked and written here
++        guard let d = t.taskDescription, let hash = d.lastIndex(of: "#"), let i = Int(d[d.index(after: hash)...]) else { return }
++        let name = String(d[..<hash])
++        let code = (t.response as? HTTPURLResponse)?.statusCode ?? 0
++        let data = try? Data(contentsOf: location, options: .mappedIfSafe)
++        q.sync {
++            queued.remove(d)
++            guard load(name), var st = states[name], let p = plans[name], i < st.done.count else { return }
++            let lo = Int64(i) * p.chunkSize, len = min(lo + p.chunkSize, p.size) - lo
++            if code == 401 || code == 403 { lastError = "The server refused access (HTTP \(code)): check the access token."; return }
++            guard (code == 206 || (code == 200 && lo == 0)), let all = data else { retry(d, "HTTP \(code)"); return }
++            let piece = code == 200 ? all.prefix(Int(len)) : all
++            guard Int64(piece.count) == len, sync.hex(SHA256.hash(data: piece)) == p.chunks[i] else { retry(d, "piece \(i) of \(name) does not match the manifest"); return }
++            let fd = open(sync.partURL(name).path, O_RDWR); guard fd >= 0 else { lastError = "cannot open \(name).part"; return }
++            let w = piece.withUnsafeBytes { pwrite(fd, $0.baseAddress, piece.count, off_t(lo)) }
++            fsync(fd); close(fd)
++            guard w == piece.count else { lastError = "write failed: is the phone full?"; return }
++            st.done[i] = true; states[name] = st
++            try? JSONEncoder().encode(st).write(to: sync.stateURL(name), options: .atomic)
++            sync.progress.add(done: len, fetched: len)
++        }
++        onProgress?()
++        pump(["msl.tar", "romfs.img"])
++    }
++
++    func urlSession(_ s: URLSession, task t: URLSessionTask, didCompleteWithError error: Error?) {
++        guard let e = error, let d = t.taskDescription else { return }
++        if (e as? URLError)?.code == .cancelled { q.sync { _ = queued.remove(d) }; return }
++        q.sync { queued.remove(d); retry(d, e.localizedDescription) }
++        pump(["msl.tar", "romfs.img"])
++    }
++
++    private func retry(_ d: String, _ why: String) {   // on q; the next pump queues the piece again
++        let n = (retries[d] ?? 0) + 1; retries[d] = n
++        fputs("game data (background): \(d): \(why); attempt \(n)\n", stderr)
++        if n > 6 { lastError = "\(d.replacingOccurrences(of: "#", with: " piece ")) keeps failing: \(why)" }
++    }
++
++    func urlSessionDidFinishEvents(forBackgroundURLSession s: URLSession) {
++        let done = Self.liveLock.withLock { Self.eventsDone.removeValue(forKey: identifier) }
++        if let h = done { DispatchQueue.main.async { h() } }
++    }
++}
+diff --git a/dm/ios/Sources/GameDataSync.swift b/dm/ios/Sources/GameDataSync.swift
+new file mode 100644
+index 0000000..9f59823
+--- /dev/null
++++ b/dm/ios/Sources/GameDataSync.swift
+@@ -0,0 +1,200 @@
++// The launcher's Game data server section: download, update and delete this game's data from the player's own server (GameDataSyncCore.swift does the work,
++// docs/game-data-server.md describes the server). The server address and access token come from the fields here, or once from Documents/env.txt
++// (DM_DATA_SERVER, DM_DATA_TOKEN). The download runs while the launcher is open; leaving the app pauses it, and the next Download resumes where it stopped.
++import SwiftUI
++import UIKit
++
++private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
++
++@MainActor
++final class GameDataModel: ObservableObject {
++    @Published var server: String { didSet { UserDefaults.standard.set(server, forKey: "gamedata.server") } }
++    @Published var token: String { didSet { UserDefaults.standard.set(token, forKey: "gamedata.token") } }
++    @Published var status = ""
++    @Published var running = false
++    @Published var line = ""          // "4.2 / 15.9 GB · 85 MB/s · 2 min left"
++    @Published var fraction = 0.0
++    @Published var note = ""
++    @Published var confirmDelete = false
++    @Published var background: Bool { didSet { UserDefaults.standard.set(background, forKey: "gamedata.background") } }   // GameDataBackground.swift: iOS keeps fetching while the app is away
++    private var task: Task<Void, Never>?
++    let gameDir = URL(fileURLWithPath: dm_game_dir())
++
++    init() {
++        let env = ProcessInfo.processInfo.environment
++        server = UserDefaults.standard.string(forKey: "gamedata.server") ?? env["DM_DATA_SERVER"] ?? ""
++        token = UserDefaults.standard.string(forKey: "gamedata.token") ?? env["DM_DATA_TOKEN"] ?? ""
++        background = UserDefaults.standard.object(forKey: "gamedata.background") as? Bool ?? true
++        refresh()
++        // A download that was running when the app was left (or that iOS kept going in the background) continues as soon as the launcher shows
++        if hasPartial && !server.isEmpty { note = "Continuing the download…"; DispatchQueue.main.async { [weak self] in self?.start() } }
++    }
++
++    var expected: String? { dm_expected_romfs_identity() }
++    /// The download folder as the Files app shows it: inside LiveContainer, below its Data/Application/<app folder>/
++    var whereShown: String {
++        let p = gameDir.path
++        // The last one: LiveContainer's own folder is a Data/Application/<id> too
++        if let r = p.range(of: "/Data/Application/", options: .backwards) { return "LiveContainer › Data › Application › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
++        if let r = p.range(of: "/Documents/") { return "On My iPhone › \((info("CFBundleDisplayName") as? String) ?? "the game") › " + p[r.upperBound...].split(separator: "/").joined(separator: " › ") }
++        return p
++    }
++    var imagePath: String { gameDir.appendingPathComponent("romfs.img").path }
++    var hasPartial: Bool { ["romfs.img.part.json", "msl.tar.part.json"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
++    nonisolated static func identifier(_ title: String) -> String { "org.nxnative.gamedata." + title }   // one background session per game: two games in one LiveContainer do not share it
++    var imageOK: Bool { dm_romfs_status(imagePath) == 0 }
++    var hasAny: Bool { ["romfs.img", "romfs.img.part", "msl.tar", "msl.tar.part", "msl"].contains { FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0).path) } }
++
++    func refresh() {
++        let want = expected.flatMap { romfsIdentityField($0, "version") } ?? ""
++        var parts: [String] = []
++        switch dm_romfs_status(imagePath) {
++        case 0: parts.append("Game files ready" + (want.isEmpty ? "" : " (\(want))"))
++        case 3: parts.append("Game files are another version: update to \(want)")
++        case 2: parts.append(hasPartial ? "Game files partly downloaded" : "Game files incomplete")
++        default: parts.append(hasPartial ? "Game files partly downloaded" : "No downloaded game files")
++        }
++        parts.append(dm_have_shaders() ? "shaders ready" : "shaders missing")
++        status = parts.joined(separator: ", ")
++        var stale: ObjCBool = false
++        if let picked = dm_picked_data_path(&stale), imageOK { note = "A location picked under Game data is in use (\((picked as NSString).lastPathComponent)): choose “Use the app's own data again” to play from the download." }
++    }
++
++    var buttonTitle: String {
++        if hasPartial { return "Resume download" }
++        if dm_romfs_status(imagePath) == 3 { return "Update game data" }
++        return imageOK && dm_have_shaders() ? "Check for updates" : "Download game data"
++    }
++
++    func start() {
++        guard !running else { return }
++        // Several addresses, separated by spaces or commas: the first that answers is used (a home or Tailscale address first is fast at home, the public one works anywhere)
++        let urls = server.split(whereSeparator: { $0 == " " || $0 == "," || $0 == "\n" }).compactMap { URL(string: String($0)) }.filter { $0.scheme == "https" || $0.scheme == "http" }
++        guard !urls.isEmpty else { note = "Enter the server address, e.g. https://games.example.com/data"; return }
++        running = true; note = ""; confirmDelete = false
++        UIApplication.shared.isIdleTimerDisabled = true
++        let sync = GameDataSync(servers: urls, token: token.trimmingCharacters(in: .whitespaces), gameDir: gameDir)
++        let want = expected
++        task = Task { [weak self] in
++            let ticker = Task { [weak self] in await self?.tick(sync.progress, sync) }
++            defer { ticker.cancel() }
++            do {
++                let (m, base) = try await sync.manifest(title: dm_game_title(), build: want.flatMap { romfsIdentityField($0, "build") })
++                if let w = want, let have = m.romfs.identity, romfsIdentityKey(w) != romfsIdentityKey(have) {
++                    throw GameDataError.mismatch("The server has \(m.name ?? m.title) \(m.version) (\(m.build)), but this app was built for \(romfsIdentityField(w, "version") ?? "another version"): publish that version, or install the matching app.")
++                }
++                let ownShaders = Bundle.main.resourceURL.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("msl").appendingPathComponent(dm_shader_dir_name()).path) } ?? false
++                var files: [(GameDataManifest.Part, String)] = []
++                if let s = m.shaders, !ownShaders {   // an IPA that carries its shaders (the default build) does not fetch them again
++                    if let d = s.dir, d != dm_shader_dir_name() { throw GameDataError.mismatch("The server's shaders are \(d), this app needs \(dm_shader_dir_name() ?? "another version"): install the app from the same build as the server's data (or publish that build).") }
++                    files.append((s, "msl.tar"))
++                }
++                files.append((m.romfs, "romfs.img"))
++                let accepts: (String) -> (URL) -> Bool = { n in n == "romfs.img" ? { dm_romfs_status($0.path) == 0 } : { _ in true } }
++                var todo: [String: [Int]] = [:]
++                for (p, n) in files { todo[n] = try await sync.prepare(p, base: base, name: n) }
++                if self?.background == true {
++                    // Handed to iOS: it keeps fetching while the app is away; this loop only watches, and Pause cancels what is still queued
++                    let bg = GameDataBackground.shared(identifier: Self.identifier(m.title), sync: sync)
++                    bg.reset(); bg.pump(files.map { $0.1 })
++                    sync.progress.set(phase: "Downloading (continues in the background)")
++                    do {
++                        while !files.allSatisfy({ sync.complete($0.1) }) {
++                            if let e = bg.lastError { throw GameDataError.server(e) }
++                            try await Task.sleep(nanoseconds: 500_000_000)
++                            if bg.pending == 0 { bg.pump(files.map { $0.1 }) }   // nothing queued but pieces missing (a cancelled or given-up piece): queue again
++                        }
++                    } catch { if error is CancellationError { bg.cancelAll() }; throw error }
++                } else {
++                    for (p, n) in files { try await sync.fetchForeground(p, base: base, name: n, todo: todo[n] ?? []) }
++                }
++                for (_, n) in files { try sync.finish(n, accepts: accepts(n)) }
++                self?.finish("Done: \(m.name ?? "game data") \(m.version) is ready (from \(sync.using?.host ?? "the server")). Press Play.")
++            } catch is CancellationError {
++                self?.finish("Paused. Download resumes where it stopped.")
++            } catch {
++                self?.finish(error.localizedDescription + (self?.hasPartial == true ? " What is done is kept: Resume continues." : ""))
++            }
++        }
++    }
++
++    func cancel() { task?.cancel() }
++
++    private func finish(_ msg: String) {
++        running = false; line = ""; task = nil
++        UIApplication.shared.isIdleTimerDisabled = false
++        refresh(); note = msg
++    }
++
++    private func tick(_ p: GameDataProgress, _ sync: GameDataSync) async {
++        var last = p.fetched, lastT = Date(), speed = 0.0
++        while !Task.isCancelled {
++            try? await Task.sleep(nanoseconds: 500_000_000)
++            let now = Date(), f = p.fetched, dt = now.timeIntervalSince(lastT)
++            if dt > 0 { let s = Double(f - last) / dt; speed = speed == 0 ? s : speed * 0.8 + s * 0.2 }
++            last = f; lastT = now
++            let total = max(p.total, 1), done = p.done
++            fraction = min(Double(done) / Double(total), 1)
++            let gb = { (b: Int64) in String(format: "%.1f", Double(b) / 1e9) }
++            var s = "\(p.phase): \(gb(done)) / \(gb(total)) GB" + (sync.using?.host.map { " via \($0)" } ?? "")
++            if speed > 1e5 {
++                s += String(format: " · %.0f MB/s", speed / 1e6)
++                let left = Double(total - done) / speed
++                s += left < 90 ? " · \(Int(left)) s left" : " · \(Int(left / 60)) min left"
++            }
++            line = s
++        }
++    }
++
++    func delete() {
++        guard confirmDelete else { confirmDelete = true; return }
++        confirmDelete = false
++        do {
++            try GameDataSync(servers: [], token: "", gameDir: gameDir).deleteGameData()
++            refresh(); note = "Game data deleted. Your saves are kept."
++        } catch { note = "Could not delete: \(error.localizedDescription)" }
++    }
++}
++
++struct GameDataServerSection: View {
++    @StateObject private var m = GameDataModel()
++
++    var body: some View {
++        Section {
++            TextField("Server address(es): home first, then public, separated by spaces", text: $m.server, axis: .vertical)
++                .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled().disabled(m.running)
++            SecureField("Access token (if the server asks for one)", text: $m.token).disabled(m.running)
++            Toggle("Keep downloading in the background", isOn: $m.background).disabled(m.running)
++            Text(m.status).foregroundStyle(.secondary)
++            if m.running {
++                ProgressView(value: m.fraction)
++                Text(m.line).font(.callout).monospacedDigit().foregroundStyle(.secondary)
++                Button("Pause", role: .cancel) { m.cancel() }
++            } else {
++                Button(m.buttonTitle) { m.start() }
++                if m.hasAny {
++                    Button(m.confirmDelete ? "Tap again to delete the game data" : "Delete game data", role: .destructive) { m.delete() }
++                }
++            }
++        } header: {
++            Text("Game data")
++        } footer: {
++            VStack(alignment: .leading, spacing: 6) {
++                if !m.note.isEmpty { Text(m.note) }
++                Text("Downloads this game's files from your server, and resumes if interrupted. Delete frees the space and keeps your saves.")
++                Text("In Files: \(m.whereShown)").font(.caption.monospaced())
++            }
++        }
++    }
++}
++
++// main.m's app delegate: iOS relaunched the app in the background because a game data download has news; the session is made again to take it,
++// and the completion handler is called once it has (GameDataBackground.urlSessionDidFinishEvents)
++@_cdecl("dm_gamedata_background_events")
++public func dmGamedataBackgroundEvents(_ identifier: NSString, _ done: @escaping @convention(block) () -> Void) {
++    let id = identifier as String
++    guard id == GameDataModel.identifier(dm_game_title()) else { done(); return }
++    GameDataBackground.liveLockedSetDone(id, done)
++    let sync = GameDataSync(servers: [], token: UserDefaults.standard.string(forKey: "gamedata.token") ?? "", gameDir: URL(fileURLWithPath: dm_game_dir()))
++    _ = GameDataBackground.shared(identifier: id, sync: sync)
++}
+diff --git a/dm/ios/Sources/GameDataSyncCore.swift b/dm/ios/Sources/GameDataSyncCore.swift
+new file mode 100644
+index 0000000..c3912a9
+--- /dev/null
++++ b/dm/ios/Sources/GameDataSyncCore.swift
+@@ -0,0 +1,259 @@
++// Game data download, the part without UI (GameDataSync.swift draws it in the launcher): fetches this build's game data from the player's own server
++// (docs/game-data-server.md, scripts/publish_gamedata.py writes what it serves) into the per-game layout main.m reads, Documents/games/<title ID>/:
++//   romfs.img   the game files, one image (dm/host/romfs_image.h). Fetched in 16 MiB chunks with HTTP Range requests, several at a time, each checked
++//               against the manifest's SHA-256 before it is written in place. That one mechanism gives resuming (chunks already done are kept in
++//               romfs.img.part.json), updates that only fetch what changed (a previous version's chunks that still match are kept) and no second copy
++//               of 16 GB on the phone. Only a complete image whose identity is the one this build needs (the check main.m makes) becomes romfs.img.
++//   msl.tar     the shader libraries of an IPA built with --shaders separate: an uncompressed ustar of b-<version>/, fetched the same way and kept as it is;
++//               the host reads the libraries straight from it (dm/gfx/nvn/nvn_mtl.m msl_pack_open), so nothing is unpacked.
++// Saves (games/<id>/save, Documents/save) are never touched, and deleting the game data keeps them.
++// Foundation and CryptoKit only, so the same file builds into a Mac test (dm/ios/tests/gamedata_sync_check.sh).
++import Foundation
++import CryptoKit
++
++struct GameDataManifest: Decodable {
++    struct Part: Decodable {
++        let url: String           // relative to the manifest's URL
++        let size: Int64
++        let sha256: String        // the whole file (for the server side's own checks; the app checks the chunks)
++        let chunkSize: Int64
++        let chunks: [String]      // SHA-256 of each chunkSize piece, the last one shorter
++        let identity: String?     // romfs: the identity line (dm/host/romfs_identity.h) of the image
++        let dir: String?          // shaders: the folder the tar holds, b-<translation chain version>
++        enum CodingKeys: String, CodingKey { case url, size, sha256, chunkSize = "chunk_size", chunks, identity, dir }
++    }
++    let format: Int
++    let title: String
++    let name: String?
++    let version: String
++    let build: String
++    let romfs: Part
++    let shaders: Part?
++}
++
++enum GameDataError: LocalizedError {
++    case server(String), mismatch(String), local(String)
++    var errorDescription: String? {
++        switch self { case .server(let s), .mismatch(let s), .local(let s): return s }
++    }
++    var isAccess: Bool { if case .server(let s) = self { return s.hasPrefix("The server refused") }; return false }
++}
++
++/// size= and index= of an identity line: what decides a match (romfs_identity.h), the rest only names the image.
++func romfsIdentityKey(_ line: String) -> String {
++    line.split(separator: " ").filter { $0.hasPrefix("size=") || $0.hasPrefix("index=") }.sorted().joined(separator: " ")
++}
++func romfsIdentityField(_ line: String, _ key: String) -> String? {
++    line.split(separator: " ").first { $0.hasPrefix(key + "=") }.map { String($0.dropFirst(key.count + 1)) }
++}
++
++/// Byte counts for the progress line: done counts every byte that is in place, fetched or kept.
++final class GameDataProgress: @unchecked Sendable {
++    private let lock = NSLock()
++    private var _total: Int64 = 0, _done: Int64 = 0, _fetched: Int64 = 0, _phase = ""
++    var total: Int64 { lock.withLock { _total } }
++    var done: Int64 { lock.withLock { _done } }
++    var fetched: Int64 { lock.withLock { _fetched } }   // over the network: what the speed is measured on
++    var phase: String { lock.withLock { _phase } }
++    func set(phase: String, total: Int64? = nil) { lock.withLock { _phase = phase; if let t = total { _total = t } } }
++    func add(done d: Int64, fetched f: Int64) { lock.withLock { _done += d; _fetched += f } }
++}
++
++extension Range where Bound == Int64 { var len: Int64 { upperBound - lowerBound } }
++
++final class GameDataSync: @unchecked Sendable {
++    static let chunkParallel = 6
++    let servers: [URL]        // e.g. a home address first, then https://games.example.com/data; the manifests are at <server>/<title ID>/[<build>/]manifest.json
++    private(set) var using: URL?   // the address that answered: the files come from it too (their URLs are relative to its manifest)
++    let token: String
++    let gameDir: URL
++    let progress = GameDataProgress()
++    private let session: URLSession, probe: URLSession
++
++    init(servers: [URL], token: String, gameDir: URL) {
++        self.servers = servers; self.token = token; self.gameDir = gameDir
++        let q = URLSessionConfiguration.ephemeral   // asking an address that is not reachable from here (the home one, away from home) gives up fast
++        q.timeoutIntervalForRequest = 4; q.waitsForConnectivity = false
++        probe = URLSession(configuration: q)
++        let c = URLSessionConfiguration.default
++        c.requestCachePolicy = .reloadIgnoringLocalCacheData; c.urlCache = nil
++        c.httpMaximumConnectionsPerHost = Self.chunkParallel
++        c.timeoutIntervalForRequest = 60
++        c.waitsForConnectivity = true
++        session = URLSession(configuration: c)
++    }
++
++    func request(_ url: URL, range: Range<Int64>? = nil) -> URLRequest {
++        var r = URLRequest(url: url)
++        if !token.isEmpty { r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
++        if let g = range { r.setValue("bytes=\(g.lowerBound)-\(g.upperBound - 1)", forHTTPHeaderField: "Range") }
++        r.setValue("identity", forHTTPHeaderField: "Accept-Encoding")   // never compressed: a Range is a byte range of the file as stored
++        return r
++    }
++
++    /// This build's manifest: <server>/<title>/<build>/manifest.json (exactly the version the app needs), else the latest one at <server>/<title>/manifest.json,
++    /// from the first address that answers (a home or Tailscale address before the public one): the download then runs from that address.
++    func manifest(title: String, build: String?) async throws -> (GameDataManifest, URL) {
++        var last = "no address"
++        for server in servers {
++            var urls: [URL] = []
++            let base = server.appendingPathComponent(title)
++            if let b = build, !b.isEmpty { urls.append(base.appendingPathComponent(b).appendingPathComponent("manifest.json")) }
++            urls.append(base.appendingPathComponent("manifest.json"))
++            for u in urls {
++                let data: Data, resp: URLResponse
++                do { (data, resp) = try await probe.data(for: request(u)) }
++                catch { last = "\(server.host ?? server.absoluteString): \(error.localizedDescription)"; fputs("game data: \(last); trying the next address\n", stderr); break }
++                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
++                if code == 401 || code == 403 { throw GameDataError.server("The server refused access (HTTP \(code)) at \(server.host ?? ""): check the access token.") }
++                guard code == 200 else { last = "HTTP \(code) for \(u.absoluteString)"; continue }
++                do { let m = try JSONDecoder().decode(GameDataManifest.self, from: data); using = server; fputs("game data: using \(server.absoluteString)\n", stderr); return (m, u) }
++                catch { throw GameDataError.server("The manifest at \(u.absoluteString) cannot be read: \(error.localizedDescription)") }
++            }
++        }
++        throw GameDataError.server("No game data for \(title) on the server (\(last)).")
++    }
++
++    private func fetch(_ url: URL, _ range: Range<Int64>, sha: String) async throws -> Data {
++        var wait: UInt64 = 1
++        for attempt in 1...6 {
++            try Task.checkCancellation()
++            do {
++                let (data, resp) = try await session.data(for: request(url, range: range))
++                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
++                if code == 401 || code == 403 { throw GameDataError.server("The server refused access (HTTP \(code)): check the access token.") }
++                guard code == 206 || (code == 200 && range.lowerBound == 0) else { throw GameDataError.server("HTTP \(code) for \(url.lastPathComponent): the server must answer Range requests (206)") }
++                let d = code == 200 ? data.prefix(Int(range.len)) : data
++                guard Int64(d.count) == range.len else { throw GameDataError.server("short read: \(d.count) of \(range.len) bytes") }
++                guard hex(SHA256.hash(data: d)) == sha else { throw GameDataError.mismatch("chunk at \(range.lowerBound) of \(url.lastPathComponent) does not match the manifest") }
++                return Data(d)
++            } catch let e as GameDataError where e.isAccess {
++                throw e   // a wrong token does not get better by retrying
++            } catch is CancellationError { throw CancellationError()
++            } catch {
++                if Task.isCancelled || (error as? URLError)?.code == .cancelled { throw CancellationError() }   // URLSession reports a cancelled task as its own error
++                if attempt == 6 { throw error }
++                fputs("game data: \(url.lastPathComponent) bytes \(range.lowerBound): \(error.localizedDescription); retry \(attempt) in \(wait) s\n", stderr)
++                try await Task.sleep(nanoseconds: wait * 1_000_000_000); wait = min(wait * 2, 30)
++            }
++        }
++        throw CancellationError()
++    }
++
++    func hex<D: Digest>(_ d: D) -> String { d.map { String(format: "%02x", $0) }.joined() }
++    func ranges(_ p: GameDataManifest.Part) -> [Range<Int64>] {
++        (0..<p.chunks.count).map { i in Int64(i) * p.chunkSize ..< min(Int64(i + 1) * p.chunkSize, p.size) }
++    }
++
++    // MARK: one file of the game data (the image, the shader archive)
++
++    struct FileState: Codable { var identity: String; var size: Int64; var chunkSize: Int64; var done: [Bool] }
++    /// What a download of one file needs after a restart, kept as <name>.part.plan.json: the background mode (GameDataBackground.swift) reads it when iOS
++    /// hands it finished pieces, perhaps in a later launch of the app
++    struct FilePlan: Codable { var name: String; var url: URL; var size: Int64; var chunkSize: Int64; var chunks: [String]; var identity: String }
++
++    func planURL(_ name: String) -> URL { gameDir.appendingPathComponent(name + ".part.plan.json") }
++    func stateURL(_ name: String) -> URL { gameDir.appendingPathComponent(name + ".part.json") }
++    func partURL(_ name: String) -> URL { gameDir.appendingPathComponent(name + ".part") }
++
++    /// Readies gameDir/<name>.part for the manifest's file: a previous version or an interrupted download becomes the starting point, and every piece
++    /// that already matches is kept. Returns the pieces still to fetch (none: finish() completes it).
++    func prepare(_ p: GameDataManifest.Part, base: URL, name: String) async throws -> [Int] {
++        let fm = FileManager.default
++        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
++        let final = gameDir.appendingPathComponent(name), part = partURL(name), stateURL = stateURL(name)
++        guard p.chunks.count == Int((p.size + p.chunkSize - 1) / max(p.chunkSize, 1)) else { throw GameDataError.server("the manifest's chunk list does not cover \(name)") }
++        // A previous version becomes the starting point: its chunks that still match are kept (an update fetches only what changed), with no second copy
++        if fm.fileExists(atPath: final.path) && !fm.fileExists(atPath: part.path) { try fm.moveItem(at: final, to: part) }
++        let fresh = !fm.fileExists(atPath: part.path)
++        let fd = open(part.path, O_RDWR | O_CREAT, 0o644)
++        guard fd >= 0 else { throw GameDataError.local("cannot open \(part.path) (errno \(errno))") }
++        defer { close(fd) }
++        guard ftruncate(fd, off_t(p.size)) == 0 else { throw GameDataError.local("not enough space for \(p.size / 1_000_000) MB (errno \(errno))") }
++        let id = p.identity ?? p.sha256
++        var state = (try? JSONDecoder().decode(FileState.self, from: Data(contentsOf: stateURL))).flatMap {
++            $0.identity == id && $0.size == p.size && $0.chunkSize == p.chunkSize && $0.done.count == p.chunks.count ? $0 : nil
++        } ?? FileState(identity: id, size: p.size, chunkSize: p.chunkSize, done: Array(repeating: false, count: p.chunks.count))
++        let rs = ranges(p)
++        progress.set(phase: "Checking the data on the phone", total: progress.total + p.size)
++        for (i, r) in rs.enumerated() where state.done[i] { progress.add(done: r.len, fetched: 0) }
++        // What is on disk already (an interrupted chunk, a previous version) is kept where it matches; a file made just now holds nothing to check
++        var todo: [Int] = []
++        var buf = [UInt8](repeating: 0, count: Int(p.chunkSize))
++        for (i, r) in rs.enumerated() where !state.done[i] {
++            try Task.checkCancellation()
++            if !fresh {
++                let n = buf.withUnsafeMutableBytes { pread(fd, $0.baseAddress, Int(r.len), off_t(r.lowerBound)) }
++                if n == Int(r.len) && hex(SHA256.hash(data: buf[0..<n])) == p.chunks[i] { state.done[i] = true; progress.add(done: r.len, fetched: 0); continue }
++            }
++            todo.append(i)
++        }
++        try JSONEncoder().encode(state).write(to: stateURL, options: .atomic)
++        let plan = FilePlan(name: name, url: URL(string: p.url, relativeTo: base)!.absoluteURL, size: p.size, chunkSize: p.chunkSize, chunks: p.chunks, identity: id)
++        try JSONEncoder().encode(plan).write(to: planURL(name), options: .atomic)
++        return todo
++    }
++
++    /// Fetches the pieces in this process, several at a time (the app has to stay open; the background mode is GameDataBackground.swift).
++    func fetchForeground(_ p: GameDataManifest.Part, base: URL, name: String, todo: [Int]) async throws {
++        let fd = open(partURL(name).path, O_RDWR); guard fd >= 0 else { throw GameDataError.local("cannot open \(name).part (errno \(errno))") }
++        defer { close(fd) }
++        let stateURL = stateURL(name)
++        var state = try JSONDecoder().decode(FileState.self, from: Data(contentsOf: stateURL))
++        let rs = ranges(p), url = URL(string: p.url, relativeTo: base)!.absoluteURL
++        progress.set(phase: todo.isEmpty ? "Checking" : name == "romfs.img" ? "Downloading game files" : "Downloading shaders")
++        let lock = NSLock(); var sinceSave = 0
++        try await withThrowingTaskGroup(of: Void.self) { g in
++            var next = todo.makeIterator()
++            func add() -> Bool {
++                guard let i = next.next() else { return false }
++                g.addTask { [self] in
++                    let r = rs[i], d = try await fetch(url, r, sha: p.chunks[i])
++                    let w = d.withUnsafeBytes { pwrite(fd, $0.baseAddress, d.count, off_t(r.lowerBound)) }
++                    guard w == d.count else { throw GameDataError.local("write failed at \(r.lowerBound) (errno \(errno)): is the phone full?") }
++                    progress.add(done: r.len, fetched: r.len)
++                    let snapshot: FileState? = lock.withLock { state.done[i] = true; sinceSave += 1; if sinceSave >= 8 { sinceSave = 0; return state }; return nil }
++                    if let s = snapshot { fsync(fd); try? JSONEncoder().encode(s).write(to: stateURL, options: .atomic) }
++                }
++                return true
++            }
++            for _ in 0..<Self.chunkParallel { if !add() { break } }
++            do { while try await g.next() != nil { _ = add() } }
++            catch { g.cancelAll(); fsync(fd); try? JSONEncoder().encode(lock.withLock { state }).write(to: stateURL, options: .atomic); throw error }
++        }
++        fsync(fd)
++        try JSONEncoder().encode(state).write(to: stateURL, options: .atomic)
++    }
++
++    /// True when every piece of <name> is in place (by its state file).
++    func complete(_ name: String) -> Bool {
++        (try? JSONDecoder().decode(FileState.self, from: Data(contentsOf: stateURL(name))))?.done.allSatisfy { $0 } ?? false
++    }
++
++    /// Swaps a complete <name>.part in as <name>. accepts: the final check (for the image, main.m's identity check on the device).
++    func finish(_ name: String, accepts: (URL) -> Bool = { _ in true }) throws {
++        let fm = FileManager.default, final = gameDir.appendingPathComponent(name), part = partURL(name)
++        guard complete(name) else { throw GameDataError.local("\(name) is not complete yet") }
++        progress.set(phase: "Checking")
++        guard accepts(part) else { throw GameDataError.mismatch("The downloaded \(name) is complete but is not the one this app needs: the server has another version.") }
++        if fm.fileExists(atPath: final.path) { try fm.removeItem(at: final) }
++        try fm.moveItem(at: part, to: final)
++        try? fm.removeItem(at: stateURL(name)); try? fm.removeItem(at: planURL(name))
++    }
++
++    /// Brings gameDir/<name> (romfs.img, msl.tar) to the manifest's file, fetched in this process.
++    func syncFile(_ p: GameDataManifest.Part, base: URL, name: String, accepts: (URL) -> Bool = { _ in true }) async throws {
++        let todo = try await prepare(p, base: base, name: name)
++        try await fetchForeground(p, base: base, name: name, todo: todo)
++        try finish(name, accepts: accepts)
++    }
++
++    /// Deletes the downloaded game data: the image, the shader libraries and any half-done download. The saves (games/<id>/save) stay.
++    func deleteGameData() throws {
++        let fm = FileManager.default
++        for n in ["romfs.img", "romfs.img.part", "romfs.img.part.json", "romfs.img.part.plan.json", "msl.tar", "msl.tar.part", "msl.tar.part.json", "msl.tar.part.plan.json", "msl", "msl.part", "msl.part.json", "temp"] {
++            let u = gameDir.appendingPathComponent(n)
++            if fm.fileExists(atPath: u.path) { try fm.removeItem(at: u) }
++        }
++    }
++}
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index f20e403..63c5560 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -24,12 +24,12 @@ private struct GameDataSection: View {
+     var body: some View {
+         Section {
+             HStack {
+-                Text("Game data")
++                Text("Using")
+                 Spacer()
+-                Text(picked.isEmpty ? "This app's folder" : (picked as NSString).lastPathComponent)
++                Text(picked.isEmpty ? "the download (or a copy in this app)" : (picked as NSString).lastPathComponent)
+                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+             }
+-            Button(picked.isEmpty ? "Choose game data…" : "Choose a different location…") { picking = true }
++            Button(picked.isEmpty ? "Choose a file instead…" : "Choose a different file…") { picking = true }
+                 // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
+                 .sheet(isPresented: $picking) {
+                     DocumentPicker(types: [.item]) { url in
+@@ -47,9 +47,11 @@ private struct GameDataSection: View {
+                     dm_clear_picked_data(); refresh(); note = ""
+                 }
+             }
++        } header: {
++            Text("Or: a file you copied, or an external drive")
+         } footer: {
+             Text(note.isEmpty
+-                 ? "Pick the game's romfs.img or its RomFS folder — an external drive or iCloud Drive works. The app remembers the choice; a re-signed build asks once more."
++                 ? "Only for game files you put on the phone yourself. A chosen file is used instead of the download; “Use the app's own data again” goes back to the download (nothing is deleted)."
+                  : note)
+         }
+         .onAppear(perform: refresh)
+@@ -156,51 +158,24 @@ private struct LauncherView: View {
+     let play: () -> Void
+     @State private var memory = os_proc_available_memory()
+ 
++    @State private var showAdvanced = false
++
+     var body: some View {
+         GeometryReader { geometry in
+-            HStack(spacing: 0) {
+-                VStack(spacing: 16) {
+-                    if let icon = appIcon() {
+-                        Image(uiImage: icon).resizable().frame(width: 96, height: 96)
+-                            .clipShape(RoundedRectangle(cornerRadius: 22))
+-                            .accessibilityHidden(true)
+-                    }
+-                    Text((info("CFBundleDisplayName") as? String) ?? "Game")
+-                        .font(.title.weight(.bold)).multilineTextAlignment(.center)
+-                    Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
+-                        .font(.callout).foregroundStyle(.secondary)
+-                    playButton
++            // Wide: a narrow column for the game and Play beside the settings; upright or narrow (a half-folded foldable, a small window): the game on top
++            let wide = geometry.size.width > geometry.size.height && geometry.size.width >= 560
++            if wide {
++                HStack(spacing: 0) {
++                    VStack(spacing: 14) { header(icon: 88) }
++                        .padding(16)
++                        .frame(width: min(260, geometry.size.width * 0.3), height: geometry.size.height)
++                    settings
+                 }
+-                .padding(16)
+-                .frame(width: geometry.size.width / 3, height: geometry.size.height)
+-                List {
+-                    ForEach(m.sections, id: \.self) { section in
+-                        let rows = m.rows(in: section)
+-                        if !rows.isEmpty {
+-                            Section(section) {
+-                                ForEach(rows) { SettingRow(s: $0, m: m) }
+-                            }
+-                        }
+-                    }
+-                    Section {
+-                        Button("Reset to tested defaults") { m.reset() }
+-                            .disabled(!m.changed)
+-                    } footer: {
+-                        Text("Brings back all settings this game was tested with.")
+-                    }
+-                    GameDataSection()
+-                    CloudSavesSection()
+-                    Section {
+-                        HStack {
+-                            Text("Memory available")
+-                            Spacer()
+-                            Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
+-                        }
+-                    }
++            } else {
++                VStack(spacing: 0) {
++                    HStack(spacing: 14) { header(icon: 56) }.padding(.horizontal, 16).padding(.vertical, 10)
++                    settings
+                 }
+-                .listStyle(.insetGrouped)
+-                .contentMargins(.horizontal, 12, for: .scrollContent)
+-                .frame(width: geometry.size.width * 2 / 3)
+             }
+         }
+         .preferredColorScheme(.dark)
+@@ -212,6 +187,60 @@ private struct LauncherView: View {
+         }
+     }
+ 
++    @ViewBuilder private func header(icon size: CGFloat) -> some View {
++        if let icon = appIcon() {
++            Image(uiImage: icon).resizable().frame(width: size, height: size)
++                .clipShape(RoundedRectangle(cornerRadius: size * 0.23))
++                .accessibilityHidden(true)
++        }
++        VStack(spacing: 4) {
++            Text((info("CFBundleDisplayName") as? String) ?? "Game")
++                .font(.title3.weight(.bold)).multilineTextAlignment(.center)
++                .lineLimit(3).minimumScaleFactor(0.7)
++            Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
++                .font(.footnote).foregroundStyle(.secondary)
++        }
++        playButton
++    }
++
++    // The settings most players change first (the list's level=basic rows), then the game data and saves; everything else under Advanced settings, closed
++    private var settings: some View {
++        List {
++            ForEach(m.sections(basic: true), id: \.self) { section in
++                let rows = m.rows(in: section, basic: true)
++                if !rows.isEmpty { Section(section) { ForEach(rows) { SettingRow(s: $0, m: m) } } }
++            }
++            GameDataServerSection()
++            GameDataSection()
++            CloudSavesSection()
++            Section {
++                DisclosureGroup("Advanced settings", isExpanded: $showAdvanced) {
++                    ForEach(m.sections, id: \.self) { section in
++                        let rows = m.rows(in: section, basic: false)
++                        if !rows.isEmpty {
++                            Text(section).font(.footnote.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 6)
++                            ForEach(rows) { SettingRow(s: $0, m: m) }
++                        }
++                    }
++                    HStack {
++                        Text("Memory available")
++                        Spacer()
++                        Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
++                    }
++                }
++            }
++            Section {
++                Button("Reset to tested defaults") { m.reset() }
++                    .disabled(!m.changed)
++            } footer: {
++                Text("Brings back all settings this game was tested with.")
++            }
++        }
++        .listStyle(.insetGrouped)
++        .listSectionSpacing(.compact)
++        .contentMargins(.horizontal, 12, for: .scrollContent)
++    }
++
+     @ViewBuilder var playButton: some View {
+         let button = Button(action: play) { Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
+         if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 04a0f51..26f0f0d 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -61,7 +61,9 @@ static void tv_attach(void);
+ 
+ @interface DmRootVC : UIViewController
+ @property (nonatomic, strong) DmGameView *game;
++@property (nonatomic, strong) UIView *stage;   // the game's area, clipping the picture (DM_SCREEN_FIT=zoom overflows it): the whole screen, or the upright half in laptop mode
+ @property (nonatomic, strong) UIView *pad;
++@property (nonatomic) BOOL split;   // laptop mode: a foldable half-folded (UIHinge partially open) with DM_HINGE_SPLIT on, the game above the fold and the pad below it
+ @property (nonatomic, strong) UILabel *fps;
+ @property (nonatomic) BOOL launched;
+ @property (nonatomic, strong) id tv;   // the TV scene accessory's registration (iOS 27)
+@@ -105,14 +107,17 @@ static void launcher_done(void) { [g_root startGame]; }
+     }
+     dm_cloud_saves_env();   // DM_SAVE_SYNC from the launcher's Cloud saves pick, before the game's first save mount reads it (CloudSaves.m, save_sync.h)
+     front_hud_env();   // before the game view makes its device (an env file's DM_METAL_HUD sets it in main.m already)
++    self.stage = [[UIView alloc] initWithFrame:self.view.bounds];
++    self.stage.clipsToBounds = YES; self.stage.backgroundColor = UIColor.blackColor;
++    [self.view addSubview:self.stage];
+     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
+-    [self.view addSubview:self.game];
++    [self.stage addSubview:self.game];
++    [self watchHinge];
+     g_layer = (CAMetalLayer *)self.game.layer;
+     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
+     else if (getenv("DM_HUD_PER_LAYER")) { g_layer.developerHUDProperties = @{@"mode": @"disabled"}; LOG("front end: Metal performance HUD off (DM_METAL_HUD)"); }   // the shell turns Metal's HUD on for every start (ShellMain.m)
+     dm_haptics_apple_init();
+-    self.pad = dm_gamepad_view(self.view.bounds);
+-    self.pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
++    self.pad = dm_gamepad_view(self.view.bounds);   // framed in viewDidLayoutSubviews: the whole screen, or the flat half in laptop mode
+     [self.view addSubview:self.pad];
+     self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
+     if (self.fps) [self.view addSubview:self.fps];
+@@ -124,7 +129,24 @@ static void launcher_done(void) { [g_root startGame]; }
+ - (void)viewDidLayoutSubviews {
+     [super viewDidLayoutSubviews];
+     CGRect b = self.view.bounds; if (!self.game) return;
+-    if (self.game.superview == self.view) self.game.frame = fit_16_9(b);   // on a TV the TV's view lays it out
++    // Laptop mode: the hinge of a half-folded foldable runs across the middle of the portrait screen, so the upper half (upright) shows the game and the lower half (flat) the pad.
++    // DM_HINGE_SPLIT_AT moves the fold line (a fraction of the height, 0.5 by default) for a device whose hinge is not in the middle
++    CGRect area = b, padArea = b;
++    if (self.split && b.size.height > b.size.width) {
++        const char *at = getenv("DM_HINGE_SPLIT_AT"); double f = at ? atof(at) : 0.5; if (!(f >= 0.2 && f <= 0.8)) f = 0.5;
++        CGFloat top = floor(b.size.height * f);
++        area = CGRectMake(0, 0, b.size.width, top);
++        padArea = CGRectMake(0, top, b.size.width, b.size.height - top);
++    }
++    self.stage.frame = area; self.pad.frame = padArea;
++    if (self.game.superview == self.stage) {   // on a TV the TV's view lays it out
++        CGFloat aw = area.size.width, ah = area.size.height, w = aw, h = ah;
++        const char *fit = getenv("DM_SCREEN_FIT");   // fit (default): 16:9 with black bars; zoom: 16:9 covering the area, its overflow clipped by the stage; stretch: the whole area
++        if (fit && !strcmp(fit, "stretch")) {}
++        else if (fit && !strcmp(fit, "zoom")) { if (w / h > 16.0 / 9.0) h = w * 9.0 / 16.0; else w = h * 16.0 / 9.0; }
++        else if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
++        self.game.frame = CGRectMake(floor((aw - w) / 2), floor((ah - h) / 2), w, h);
++    }
+     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
+         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+@@ -145,7 +167,27 @@ static void launcher_done(void) { [g_root startGame]; }
+ - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+ - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
+ - (BOOL)prefersStatusBarHidden { return YES; }
+-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
++- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return self.split ? UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskLandscape : UIInterfaceOrientationMaskLandscape; }   // laptop mode holds the screen upright, the fold across it (portrait); held sideways it stays the landscape layout
++// Foldables (iOS 27.1 UIHinge): half-folded with DM_HINGE_SPLIT on (the launcher's Laptop mode, on by default) splits the screen at the fold; flat or closed goes back to the landscape layout
++- (void)watchHinge {
++    const char *on = getenv("DM_HINGE_SPLIT");
++    if (on && !strcmp(on, "0")) return;
++    if (@available(iOS 27.1, *)) {
++        __weak DmRootVC *weak = self;
++        UIHingeInteraction *hi = [[UIHingeInteraction alloc] initWithUpdateHandler:^(UIHingeInteraction *i, UIHingeInteractionUpdate *u) {
++            (void)i; DmRootVC *me = weak; if (!me) return;
++            BOOL split = u.hinge && u.hinge.status == UIHingeStatusPartiallyOpen;
++            if (split == me.split) return;
++            me.split = split;
++            LOG("front end: %s (hinge %s, %.0f degrees)", split ? "laptop mode, game above the fold and controls below" : "full-screen layout",
++                !u.hinge ? "unavailable" : u.hinge.status == UIHingeStatusClosed ? "closed" : u.hinge.status == UIHingeStatusPartiallyOpen ? "half open" : u.hinge.status == UIHingeStatusFullyOpen ? "open" : "unknown",
++                u.hinge ? u.hinge.angle * 180.0 / M_PI : 0.0);
++            [me setNeedsUpdateOfSupportedInterfaceOrientations];
++            [me.view setNeedsLayout];
++        }];
++        [self.view addInteraction:hi];
++    }
++}
+ @end
+ UIViewController *front_ios_root(void) { return [DmRootVC new]; }
+ 
+@@ -171,7 +213,8 @@ static void tv_attach(void) {
+ }
+ static void tv_detach(void) {
+     DmGameView *v = g_root.game; g_tv = nil;
+-    if (v && v.superview != g_root.view) { [g_root.view insertSubview:v atIndex:0]; [g_root.view setNeedsLayout]; }
++    UIView *home = g_root.stage ?: g_root.view;   // back into the game's area (laptop mode's upper half, or the whole screen)
++    if (v && v.superview != home) { [home insertSubview:v atIndex:0]; [g_root.view setNeedsLayout]; }
+     if (g_tv_mode_was >= 0) { dm_set_opmode(g_tv_mode_was); g_tv_mode_was = -1; }
+     LOG("front end: TV disconnected, the picture is back on the phone");
+ }
+diff --git a/dm/ios/Sources/main.m b/dm/ios/Sources/main.m
+index 58fa969..b8fe014 100644
+--- a/dm/ios/Sources/main.m
++++ b/dm/ios/Sources/main.m
+@@ -14,6 +14,7 @@
+ #include "romfs_image.h"
+ #include "DataBookmark.h"
+ #include "romfs_identity.h"
++#import "GameData.h"
+ #include "player_env.h"
+ #ifndef DM_PLAYER_BUILD
+ #define DM_PLAYER_BUILD 0
+@@ -168,6 +169,19 @@ static int set_data_env(NSString *romfs, BOOL force) {
+     BOOL per_game = [romfs hasPrefix:gdir];
+     NSString *save_dir = per_game ? [gdir stringByAppendingPathComponent:@"save"] : [doc stringByAppendingPathComponent:@"save"];
+     NSString *temp_dir = per_game ? [gdir stringByAppendingPathComponent:@"temp"] : [doc stringByAppendingPathComponent:@"temp"];
++    // Game data that moves into the per-game layout (a download from the game data server, GameDataSync.swift) must not leave the player's saves behind in
++    // Documents/save: the first time the per-game save folder is needed, it starts as a copy of them. A copy, not a move: the old folder stays as a backup
++    NSString *old_save = [doc stringByAppendingPathComponent:@"save"];
++    if (per_game && ![fm fileExistsAtPath:save_dir] && [fm fileExistsAtPath:old_save]) {
++        NSError *e = nil;
++        [fm createDirectoryAtPath:gdir withIntermediateDirectories:YES attributes:nil error:nil];
++        if ([fm copyItemAtPath:old_save toPath:save_dir error:&e]) fprintf(stderr, "boot: saves copied from %s to the per-game folder %s\n", old_save.fileSystemRepresentation, save_dir.fileSystemRepresentation);
++        else fprintf(stderr, "[RED] boot: the saves in %s could not be copied to %s (%s)\n", old_save.fileSystemRepresentation, save_dir.fileSystemRepresentation, e.localizedDescription.UTF8String);
++    }
++    if (force) {   // at Play: shader libraries downloaded since the launch (GameDataSync.swift) are only found now; shmap_load reads DM_MSL_DIR when the game starts
++        NSString *dl = [[gdir stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:dm_shader_dir_name()];
++        if ([fm fileExistsAtPath:dl] || [fm fileExistsAtPath:[gdir stringByAppendingPathComponent:@"msl.tar"]]) setenv("DM_MSL_DIR", [gdir stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 1);
++    }
+     for (NSString *d in @[save_dir, temp_dir]) [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
+     setenv("DM_SAVE", save_dir.fileSystemRepresentation, force);
+     setenv("DM_TEMP", temp_dir.fileSystemRepresentation, force);
+@@ -178,7 +192,11 @@ static int set_data_env(NSString *romfs, BOOL force) {
+ // front_ios.m calls this from the launcher's Play: (re)decide where the game data is — a location
+ // picked in the launcher this session takes effect at once — and NO when there still is none, so
+ // the launcher comes back instead of the game failing inside the host.
+-int dm_locate_game_data(void) { return set_data_env(romfs_locate(), YES); }
++// It also says NO without shader libraries (an IPA built with --shaders separate, before its download): the launcher's Game data section shows what is missing.
++int dm_locate_game_data(void) {
++    if (!dm_have_shaders()) { fprintf(stderr, "[RED] boot: no shader libraries (an IPA built with --shaders separate): download the game data in the launcher\n"); return 0; }
++    return set_data_env(romfs_locate(), YES);
++}
+ 
+ // Add-on content (DLC): each DLC's RomFS image at <dir>/<index>.img (or a legacy <index>/ folder). Like the game files, Documents/aoc comes before <App>/aoc.
+ // A DM_AOC_DIR that is already set (env.txt, the launch environment) wins. The host mounts and counts the DLC from DM_AOC_DIR (hle_fs.c, hle_misc.c)
+@@ -295,8 +313,10 @@ static int boot_env(void) {
+     setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
+     // Shader libraries: a game's own <gdir>/msl first (a per-game layout may carry its own), else
+     // the app's shared <App>/msl.
++    // A downloaded set (GameDataSync.swift) counts wherever the game files are: an IPA built with --shaders separate has no <App>/msl at all
+     NSString *per_game_msl = [gdir stringByAppendingPathComponent:@"msl"];
+-    NSString *msl = (per_game && [fm fileExistsAtPath:per_game_msl]) ? per_game_msl : [res stringByAppendingPathComponent:@"msl"];
++    BOOL downloaded_msl = [fm fileExistsAtPath:[per_game_msl stringByAppendingPathComponent:dm_shader_dir_name()]] || [fm fileExistsAtPath:[gdir stringByAppendingPathComponent:@"msl.tar"]];   // the host reads <DM_MSL_DIR>.tar in place
++    NSString *msl = ((per_game && [fm fileExistsAtPath:per_game_msl]) || downloaded_msl) ? per_game_msl : [res stringByAppendingPathComponent:@"msl"];
+     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
+     setenv("DM_FONT_DIR", [app_dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
+     // Add-on content beside the game data: the launcher's games/<id>/aoc/ holds <index>.img (the layout hle_fs.c aoc_dir reads), because a slim IPA does not carry it. Taken before
+@@ -337,6 +357,11 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
+ - (UISceneConfiguration *)application:(UIApplication *)a configurationForConnectingSceneSession:(UISceneSession *)s options:(UISceneConnectionOptions *)o {
+     return [[UISceneConfiguration alloc] initWithName:[s.role isEqualToString:UIWindowSceneSessionRoleExternalDisplayNonInteractive] ? @"TV" : @"Default" sessionRole:s.role];   // a TV (front_ios.m DmTVSceneDelegate)
+ }
++// A background game data download has finished pieces for the app (GameDataBackground.swift): hand them over, and tell iOS when they are taken
++- (void)application:(UIApplication *)a handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void (^)(void))done {
++    extern void dm_gamedata_background_events(NSString *, void (^)(void));
++    dm_gamedata_background_events(identifier, done);
++}
+ @end
+ 
+ // Scene lifecycle: create the window + hand focus events to front_ios.m
+diff --git a/dm/ios/project.yml b/dm/ios/project.yml
+index ed0010a..71917e8 100644
+--- a/dm/ios/project.yml
++++ b/dm/ios/project.yml
+@@ -32,12 +32,13 @@ targets:
+         CFBundleDisplayName: ${DM_DISPLAY_NAME}   # the game name in the base NSP (set by build_ipa.sh)
+         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+         CFBundleShortVersionString: $(MARKETING_VERSION)
+-        UILaunchStoryboardName: ""
++        UILaunchScreen: {}   # a launch screen (an empty one: black) declares the app fits every screen size; without it iOS runs it zoomed in a legacy phone-sized frame (seen on the foldable iPhone's inner screen)
+         UIFileSharingEnabled: true          # Documents (log.txt, saves) visible in the Files app
+         LSSupportsOpeningDocumentsInPlace: true
+         UISupportedInterfaceOrientations:
+           - UIInterfaceOrientationLandscapeRight
+           - UIInterfaceOrientationLandscapeLeft
++          - UIInterfaceOrientationPortrait  # only while a foldable is half-folded (laptop mode, front_ios.m supportedInterfaceOrientations)
+         UIRequiresFullScreen: true
+         UIStatusBarHidden: true
+         UIViewControllerBasedStatusBarAppearance: false
+@@ -63,7 +64,7 @@ targets:
+       PRODUCT_BUNDLE_IDENTIFIER: ${DM_BUNDLE_ID}
+       PRODUCT_NAME: DmIOS
+       MARKETING_VERSION: ${DM_APP_VERSION}         # the game's display version: the packed update's, else the base game's (set by build_ipa.sh)
+-      CURRENT_PROJECT_VERSION: ${DM_APP_VERSION}
++      CURRENT_PROJECT_VERSION: ${DM_BUILD_NUMBER}   # CFBundleVersion: the build's UTC time (YYYYMMDDhhmm, build_ipa.sh), so every rebuild is newer to a sideloader even when the game version stays
+       DEVELOPMENT_TEAM: ${DM_TEAM_ID}
+       CODE_SIGN_STYLE: Automatic
+       ENABLE_USER_SCRIPT_SANDBOXING: NO    # the game's files live on the external drive
+diff --git a/dm/ios/tools/build_ipa.sh b/dm/ios/tools/build_ipa.sh
+index b089a94..d329ad5 100755
+--- a/dm/ios/tools/build_ipa.sh
++++ b/dm/ios/tools/build_ipa.sh
+@@ -48,7 +48,7 @@ NACP=$W/data/v0/control.nacp; [ -f "$NACP" ] || NACP=$(dirname "$ROMFS")/control
+ [ -n "${DM_DISPLAY_NAME:-}" ] || DM_DISPLAY_NAME=$(python3 "$DM/tools/nacp.py" "$NACP") || die "no game name in $NACP (re-extract with nx_extract, or set DM_DISPLAY_NAME)"
+ VNACP=$(dirname "$ROMFS")/control.nacp; [ -f "$VNACP" ] || VNACP=$W/data/v0/control.nacp
+ [ -n "${DM_APP_VERSION:-}" ] || DM_APP_VERSION=$(python3 "$DM/tools/nacp.py" --version "$VNACP") || { t "no display version in $VNACP: the app version is 1.0"; DM_APP_VERSION=1.0; }
+-export LC_ALL=C DM_BUNDLE_ID=${DM_BUNDLE_ID:-org.nxnative.$(echo "$GAME" | tr 'A-Z' 'a-z')} DM_DISPLAY_NAME DM_APP_VERSION DM_APP_CATEGORY=$(gp app_category) DM_TEAM_ID=${DM_TEAM_ID:-0000000000}   # placeholder identity: unsigned, the install tool replaces it
++export LC_ALL=C DM_BUNDLE_ID=${DM_BUNDLE_ID:-org.nxnative.$(echo "$GAME" | tr 'A-Z' 'a-z')} DM_DISPLAY_NAME DM_APP_VERSION DM_APP_CATEGORY=$(gp app_category) DM_TEAM_ID=${DM_TEAM_ID:-0000000000} DM_BUILD_NUMBER=${DM_BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}   # placeholder identity: unsigned, the install tool replaces it
+ if [ "${DM_SHOW_FPS:-0}" = 1 ]; then export DM_SHOW_FPS=YES; else export DM_SHOW_FPS=NO; fi
+ export DM_LANG=${DM_LANG:-en-US}
+ export DM_FORK_PATCHES=$(paste -sd, "$DM/fork_patches.txt" 2>/dev/null || true)   # DMForkPatches in Info.plist (scripts/patches.py writes the list; empty on a build without fork patches)
+@@ -278,13 +278,20 @@ if [ "${DM_COPY_ROMFS:-YES}" = NO ]; then
+     MAPS=("$P/romfs.id=$O/romfs.id"); t "game files identity: $(cat "$O/romfs.id")"
+   fi
+ elif [ -f "$ROMFS" ]; then MAPS=("$P/romfs.img=$ROMFS"); else MAPS=("$P/romfs=$ROMFS"); fi
+-if [ "$DM_COPY_ROMFS" != NO ] && [ -n "$AOC" ] && [ -d "$AOC" ]; then
++# main.m finds add-on content only in the app (<App>/aoc), so a slim IPA still packs it while it is small (up to 64 MB: Mario Kart 8 Deluxe's Booster Course Pass is 4 KB, its tracks are in the update;
++# DM_AOC_MAX_MB raises the limit for a game whose DLC carries real content, such as Breath of the Wild's 1.4 GB Master Trials)
++if [ -n "$AOC" ] && [ -d "$AOC" ] && { [ "$DM_COPY_ROMFS" != NO ] || [ "$(du -sk "$AOC" | cut -f1)" -le $(( ${DM_AOC_MAX_MB:-64} * 1024 )) ]; }; then
+   MAPS+=("$P/aoc=$AOC"); t "add-on content packed into the IPA: $(ls "$AOC" | tr '\n' ' ')"
+ elif [ -n "$AOC" ] && [ -d "$AOC" ]; then
+   t "add-on content alongside the game data (DM_FULL_ROMFS=1 packs it): $(ls "$AOC" | tr '\n' ' ')"
+ fi
+ if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
+-MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
++# DM_SHADERS=separate (the NSP script's --shaders separate): the shader libraries stay out of the IPA, which shrinks from about 1.5 GB to about 100 MB; the app then takes them from
++# Documents/games/<title ID>/msl, where its game data download puts them (GameDataSync.swift, scripts/publish_gamedata.py)
++# Only the NVN chain libraries (b-<version>) can be read from the downloaded msl.tar (nvn_mtl.m); a Vulkan or OpenGL game's single library stays in the IPA
++if [ "${DM_SHADERS:-bundle}" = separate ] && [ "$GFXAPI" != nvn ]; then t "shader libraries stay in the IPA: DM_SHADERS=separate is for NVN games, this one is $GFXAPI"; fi
++if [ "${DM_SHADERS:-bundle}" = separate ] && [ "$GFXAPI" = nvn ]; then t "shader libraries left out of the IPA (DM_SHADERS=separate): the app downloads them with the game data"; MAPS+=("$P=$APP")
++else MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP"); fi
+ t "pack IPA (already-compressed game files stored, everything else deflated)"
+ # The pulling vertex libraries (<key>_bp, dm/gfx/tools/dmsh_pull.py) serve the hybrid pipelines. Default to the same pso_mtl4 setting compiled by gen_build.py; IOS_PULL=0 / 1 overrides it.
+ # The pipeline archive's bases are made of them, so an IPA with an archive (pso/) always carries them, whatever IOS_PULL says (an Xcode build copies them always).
+diff --git a/dm/tools/tests/test_launcher_settings.py b/dm/tools/tests/test_launcher_settings.py
+index cd43d2d..562f207 100644
+--- a/dm/tools/tests/test_launcher_settings.py
++++ b/dm/tools/tests/test_launcher_settings.py
+@@ -59,10 +59,10 @@ class LauncherSettingsTests(unittest.TestCase):
+         s = build(BOTW, 'nvn')['DM_SHOW_FPS']
+         self.assertEqual((s['on'], s['off']), ('1', '0'))
+ 
+-    def test_iphone_switches_only_on_the_iphone(self):   # the frame-rate counter and touch feedback are the iOS front end's (front_ios.m, DmGamepad.m)
++    def test_iphone_switches_only_on_the_iphone(self):   # the frame-rate counter, screen fit and touch feedback are the iOS front end's (front_ios.m, DmGamepad.m)
+         ios, mac = build(BOTW, 'nvn'), build(BOTW, 'nvn', 'mac')
+         self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
+-        self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS'})
++        self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_SCREEN_FIT', 'DM_TOUCH_HAPTICS'})
+         self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
+         self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN'})   # the Mac window's Display mode (front_mac.m reads 1 or 0)
+         s = mac['DM_FULLSCREEN']
+@@ -95,7 +95,7 @@ class LauncherSettingsTests(unittest.TestCase):
+             listed = settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
+         rows = {s['env']: s for s in listed['settings']}
+         self.assertEqual(listed['schema'], 1)
+-        self.assertEqual([e for e, s in rows.items() if s.get('level') == 'basic'], ['DM_FPS_TARGET', 'DM_RENDER_SCALE', 'DM_OPMODE', 'DM_LANG', 'DM_RUMBLE'])
++        self.assertEqual([e for e, s in rows.items() if s.get('level') == 'basic'], ['DM_FPS_TARGET', 'DM_RENDER_SCALE', 'DM_OPMODE', 'DM_LANG', 'DM_SCREEN_FIT', 'DM_RUMBLE'])
+         self.assertEqual(rows['DM_RUMBLE_GAIN']['needs'], 'DM_RUMBLE=1')
+         self.assertFalse({'level', 'needs'} & set(rows['DM_METAL_HUD']), 'a row without meta has no optional fields')
+ 
+diff --git a/docs/game-data-server.md b/docs/game-data-server.md
+new file mode 100644
+index 0000000..dc98945
+--- /dev/null
++++ b/docs/game-data-server.md
+@@ -0,0 +1,46 @@
++# Game data server
++
++An iPhone app built with `--romfs separate` can download its game data from your own server, instead of copying it over USB or the Files app. Its launcher has a **Game data server** section: enter the server address and access token, then press **Download game data**. The download resumes after an interruption, checks every piece, and an update fetches only what changed. **Delete game data** frees the space and keeps your saves.
++
++## What the server holds
++
++```
++/data/<title ID>/<build>/romfs.img       the game files image, exactly as built
++/data/<title ID>/<build>/msl.tar         the shader libraries (plain ustar, uncompressed), for an IPA built with --shaders separate
++/data/<title ID>/<build>/manifest.json   sizes, SHA-256 per 16 MiB chunk, the image's identity
++/data/<title ID>/manifest.json           the latest version
++/ipa/<title ID>/<build>-<CFBundleVersion>.ipa
++/source.json                             AltStore-format source
++```
++
++The app's server setting is `<server>/data`. It asks for `/data/<title ID>/<build>/manifest.json`, the exact version its `romfs.id` names, and then for `/data/<title ID>/manifest.json`. URLs inside a manifest are relative to the manifest. Every request carries `Authorization: Bearer <token>`.
++
++The server must answer Range requests with 206, and must not compress `/data` or `/ipa`. Any static file server does this, for example Caddy `file_server` or nginx with gzip off.
++
++## Publishing a game
++
++```bash
++python3 scripts/build_ipa_from_nsp.py ~/Games/TotK -k ~/Games/TotK/prod.keys --romfs separate [--shaders separate]
++python3 scripts/publish_gamedata.py ~/Games/TotK --out ~/Games/server-staging --ipa ~/Games/TotK/TotK.ipa --base-url https://games.example.com
++rsync -a --partial --inplace -P ~/Games/server-staging/ user@server:/srv/games/
++```
++
++`publish_gamedata.py` checks that the IPA's `romfs.id` names this image before it writes anything. On the same volume the image is hard-linked rather than copied. Don't repack or recompress `romfs.img` on the server: the manifest's chunk hashes are of the file as built.
++
++`--shaders separate` leaves the 1–1.5 GB of shader libraries out of the IPA, so the IPA is about 100 MB, and the app downloads them with the game data. An IPA without its shaders can't start until that download is done.
++
++## Manifest
++
++```json
++{
++ "format": 1, "title": "0100F2C0115B6000", "name": "…", "version": "1.4.3", "build": "v720896", "published": "2026-10-30T10:00:00Z",
++ "romfs":   {"url": "romfs.img", "size": 17046402254, "sha256": "…", "chunk_size": 16777216, "chunks": ["…"], "identity": "DMROMFSID1 title=… size=… index=…"},
++ "shaders": {"url": "msl.tar",   "size": 1530000000,  "sha256": "…", "chunk_size": 16777216, "chunks": ["…"], "dir": "b-373efc7add5f"}
++}
++```
++
++`identity` must name the same image as the app's `romfs.id` (its `size` and `index`). That is how the app tells "this version" from "update needed". `shaders.dir` must be the app's translation chain version.
++
++## On the phone
++
++Downloads go to `Documents/games/<title ID>/` in the app's data folder (`romfs.img`, `msl/`). That folder is the one `main.m` reads first, after any location picked under **Game data**. The first time the app uses that folder, it copies the saves from `Documents/save` into `games/<title ID>/save`. Keep the app open while it downloads: iOS pauses it in the background, and the next **Download** resumes where it stopped.
+diff --git a/docs/settings.md b/docs/settings.md
+index 0f992d4..4a653d9 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -3,7 +3,7 @@
+ The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
+ 
+ - [Tested defaults](#tested-defaults)
+-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game language](#game-language), [Frame-rate counter](#frame-rate-counter)
++- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game language](#game-language), [Frame-rate counter](#frame-rate-counter), [Screen fit](#screen-fit)
+ - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff)
+ - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+ - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
+@@ -16,7 +16,7 @@ Each game comes with the settings it was tested with: its profile in this reposi
+ 
+ When you change a setting and tap **Play**, the app keeps your choice, also when a later build of the app ships other defaults. A setting you leave at its default is not stored: it follows the defaults of the build you have, so a newer build's tested settings reach you without doing anything. **Reset to tested defaults** at the bottom sets every setting back to its default, and **Play** then forgets your choices, so the game's defaults apply again. For testing, a line in `Documents/env.txt` overrides any setting ([Settings in a file](#settings-in-a-file)).
+ 
+-A Mac app carries the same list (`Contents/Resources/dm/launcher.json`), without the iPhone's own Frame-rate counter and Touch feedback, for a front end that starts the app with the chosen values ([Front ends](frontends.md)).
++A Mac app carries the same list (`Contents/Resources/dm/launcher.json`), without the iPhone's own Frame-rate counter, Screen fit and Touch feedback, for a front end that starts the app with the chosen values ([Front ends](frontends.md)).
+ 
+ ## Game
+ 
+@@ -59,12 +59,20 @@ The game's own languages. The app was packed with one of them; pick another here
+ 
+ Shows the frames per second at the top left.
+ 
++### Screen fit
++
++How the 16:9 picture meets a screen of another shape (iPhone only). **Fit** keeps the whole picture with black bars, **Fill (crop edges)** zooms until the bars are gone and cuts off what overflows, **Fill (stretch)** stretches the picture to the screen.
++
+ ## Controls
+ 
+ ### Touch feedback
+ 
+ A light tap from the phone when you press an on-screen button.
+ 
++### Laptop mode (automatic)
++
++On a foldable iPhone (iOS 27.1 or later), half-folding it like a laptop puts the game on the upright half and the on-screen controls on the flat half; unfolded or closed, the usual landscape layout returns. It has no switch: `DM_HINGE_SPLIT=0` in `env.txt` turns it off, and `DM_HINGE_SPLIT_AT` moves the fold line (a fraction of the height, `0.2` to `0.8`; the middle by default).
++
+ ### Game rumble
+ 
+ The game's vibration, on the phone or on a connected controller.
+@@ -183,7 +191,7 @@ Sets every setting back to the game's tested default; **Play** then forgets your
+ 
+ ## The Mac settings window
+ 
+-A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. The window shows the most used ones first: **Frame rate**, **Render scale**, **Console mode**, **Game language**, **Display mode** and **Game rumble**, when the game has them. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). The others are under **Advanced settings**, in the usual sections, with **Reset to tested defaults**. The window remembers whether Advanced settings is open. **Frame-rate counter** and **Touch feedback** are only on the iPhone.
++A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. The window shows the most used ones first: **Frame rate**, **Render scale**, **Console mode**, **Game language**, **Display mode** and **Game rumble**, when the game has them. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). The others are under **Advanced settings**, in the usual sections, with **Reset to tested defaults**. The window remembers whether Advanced settings is open. **Frame-rate counter**, **Screen fit** and **Touch feedback** are only on the iPhone.
+ 
+ Click **Play** (or press Return) to start the game. **Quit**, ⌘Q or closing the window ends the app without the game. The app remembers your choices for that game, and a game started without the window, from a front end or with the window turned off, uses them too ([Saved choices](frontends.md#saved-choices)). A setting fixed by an `env.txt` or by the program that started the app is shown greyed out.
+ 
+@@ -224,6 +232,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under
+ | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
+ | Cloud saves folder (Mac) | `DM_SAVE_SYNC` | a folder; `icloud`: iCloud Drive › nxnative Saves; `0`: off |
+ | Frame-rate counter | `DM_SHOW_FPS` | `1`, `0` |
++| Screen fit | `DM_SCREEN_FIT` | `fit`, `zoom`, `stretch` |
+ | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
+ | Game rumble | `DM_RUMBLE` | `1`, `0` |
+ | Rumble strength | `DM_RUMBLE_GAIN` | `0` to `3` |
+diff --git a/scripts/build_ipa_from_nsp.py b/scripts/build_ipa_from_nsp.py
+index a287425..b2ce38b 100755
+--- a/scripts/build_ipa_from_nsp.py
++++ b/scripts/build_ipa_from_nsp.py
+@@ -2218,6 +2218,7 @@ def parse_args(argv):
+     ap.add_argument('--bundle-id', help='the app\'s bundle ID (default: saved Xcode ID when preparing again, else org.nxnative.<base game title ID in lowercase>)')
+     ap.add_argument('--romfs', choices=('bundle', 'separate'), help='bundle = the game files go into the IPA (default: the ROMFS setting, bundle); separate = they stay out of the IPA and the Xcode app: the build is small and fast, and the RomFS image '
+                     'is copied to the phone once per game version with the scripts/push_romfs.sh command printed at the end (the app refuses an image of another version)')
++    ap.add_argument('--shaders', choices=('bundle', 'separate'), default='bundle', help='bundle = the Metal shader libraries go into the IPA (default); separate = they stay out of it (an IPA of about 100 MB instead of 1.5 GB) and the app downloads them with the game data from your server (scripts/publish_gamedata.py, docs/game-data-server.md)')
+     ap.add_argument('--prepare-xcode', action='store_true', help='prepare a per-game Xcode project and add it to the shared workspace instead of packing an IPA (requires keeping extracted files)')
+     ap.add_argument('--framework', action='store_true', help='the game\'s modules go into DmIOS.app/Frameworks/DmGame.framework, which the app dlopens at launch (route C, docs/launcher-c-plan.md M1), instead of the executable; the IPA is otherwise the usual one')
+     ap.add_argument('--shell-framework', metavar='FOLDER', help='route C\'s shell (docs/launcher-c-plan.md M2): build only the game\'s framework, FOLDER/DmGame<title ID>.framework '
+@@ -2596,6 +2597,7 @@ def main(args=None):
+     if args.framework: ipa_env['DM_FRAMEWORK'] = '1'; say('route C: the game\'s modules go into DmIOS.app/Frameworks/DmGame.framework (DM_FRAMEWORK=1)')
+     separate = romfs_mode == 'separate'
+     if separate: ipa_env['DM_COPY_ROMFS'] = 'NO'; say('game files: separate (DM_COPY_ROMFS=NO), left out of the app; the image stays at ' + str(rfs.source(game)))
++    if args.shaders == 'separate': ipa_env['DM_SHADERS'] = 'separate'; say('shader libraries: separate, left out of the app (the app downloads them with the game data: scripts/publish_gamedata.py)')
+     if app_version: ipa_env['DM_APP_VERSION'] = app_version
+     if icon: ipa_env['DM_ICON'] = str(icon); say(f'app icon: {icon}')   # app icon (found above)
+     else: say('[RED] no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the home-screen icon will be blank')
+diff --git a/scripts/publish_gamedata.py b/scripts/publish_gamedata.py
+new file mode 100644
+index 0000000..f197f7c
+--- /dev/null
++++ b/scripts/publish_gamedata.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python3
++"""Publish a built game to your game data server's folder, for the app's download (dm/ios/Sources/GameDataSync*.swift, docs/game-data-server.md).
++
++    python3 scripts/publish_gamedata.py ~/Games/TotK --out /srv/games [--ipa ~/Games/TotK/TotK.ipa] [--base-url https://games.example.com] [--copy]
++
++Reads the NSP folder's build (<title ID>_build/, what build_ipa_from_nsp.py --romfs separate leaves) and writes, under --out:
++    data/<title ID>/<build>/romfs.img       the game files image, as built (a hard link when --out is on the same volume, else a copy; --copy always copies)
++    data/<title ID>/<build>/msl.tar         the shader libraries, an uncompressed ustar of b-<version>/ (for an IPA built with --shaders separate)
++    data/<title ID>/<build>/manifest.json   what the app reads: sizes, whole-file and per-chunk SHA-256, the image's identity
++    data/<title ID>/manifest.json           the same, as the latest version
++    ipa/<title ID>/<build>-<CFBundleVersion>.ipa and source.json (AltStore format), with --ipa and --base-url
++The app asks for <server>/<title ID>/<build>/manifest.json, the exact version its romfs.id names, then <server>/<title ID>/manifest.json; set its
++server address to <base URL>/data. URLs inside a manifest are relative to it. Serve the folder with HTTP Range support and without compression.
++"""
++import argparse, hashlib, json, os, plistlib, re, shutil, subprocess, sys, tarfile, zipfile
++from datetime import datetime, timezone
++from pathlib import Path
++
++CHUNK = 16 << 20   # the app fetches and checks 16 MiB at a time (GameDataSyncCore.swift)
++REPO = Path(__file__).resolve().parent.parent
++
++
++def hashes(path):
++    whole, chunks = hashlib.sha256(), []
++    with open(path, 'rb') as f:
++        while b := f.read(CHUNK):
++            whole.update(b); chunks.append(hashlib.sha256(b).hexdigest())
++    return whole.hexdigest(), chunks
++
++
++def part(path, url, **extra):
++    sha, chunks = hashes(path)
++    return dict(url=url, size=path.stat().st_size, sha256=sha, chunk_size=CHUNK, chunks=chunks, **extra)
++
++
++def place(src, dst, copy):
++    if dst.exists():
++        if dst.stat().st_size == src.stat().st_size and (dst.samefile(src) or dst.stat().st_mtime >= src.stat().st_mtime): return
++        dst.unlink()
++    dst.parent.mkdir(parents=True, exist_ok=True)
++    if not copy:
++        try: os.link(src, dst); return
++        except OSError: pass
++    shutil.copyfile(src, dst)
++
++
++def ustar(src_dir, tar_path, keep=lambda p: True):
++    """b-<version>/ and its files, in name order, as plain ustar: no pax headers, no compression (what the app's unpacker reads). keep: which files go in."""
++    tmp = tar_path.with_suffix('.tar.tmp')
++    with tarfile.open(tmp, 'w', format=tarfile.USTAR_FORMAT) as t:
++        def add(p):
++            info = t.gettarinfo(str(p), arcname=str(p.relative_to(src_dir.parent)))
++            info.uid = info.gid = 0; info.uname = info.gname = ''; info.mtime = 0; info.mode = 0o755 if p.is_dir() else 0o644
++            if p.is_dir(): t.addfile(info)
++            else:
++                with open(p, 'rb') as f: t.addfile(info, f)
++        add(src_dir)
++        for p in sorted(src_dir.rglob('*')):
++            if p.is_dir() or keep(p): add(p)
++    tmp.replace(tar_path)
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
++    ap.add_argument('nsp_dir', type=Path, help='the game\'s NSP folder, holding <title ID>_build/ from build_ipa_from_nsp.py --romfs separate')
++    ap.add_argument('--out', type=Path, required=True, help='the server\'s root folder (it gets data/, ipa/ and source.json)')
++    ap.add_argument('--ipa', type=Path, help='the IPA to publish beside the data (its romfs.id must name this image)')
++    ap.add_argument('--base-url', help='the server\'s public address, e.g. https://games.example.com: needed for source.json')
++    ap.add_argument('--copy', action='store_true', help='copy the image instead of hard-linking it')
++    ap.add_argument('--with-pull-libs', action='store_true', help='keep the _bp.metallib pulling-vertex libraries, which build_ipa.sh leaves out unless the profile turns pso_mtl4 on (used only when the IPA has no shaders to copy the list from)')
++    ap.add_argument('--no-shaders', action='store_true', help='leave the shader libraries out (for apps that carry their own)')
++    a = ap.parse_args()
++
++    builds = sorted(a.nsp_dir.expanduser().glob('*_build'))
++    if len(builds) != 1: sys.exit(f'expected one <title ID>_build folder in {a.nsp_dir}, found {len(builds)}')
++    work = builds[0]; title = work.name.split('_')[0].upper()
++    images = sorted((p for p in (work / 'extract').glob('v*/RomFS.img') if re.fullmatch(r'v\d+', p.parent.name)), key=lambda p: int(p.parent.name[1:]))   # not v0.partial/: an extraction cut off
++    if not images: sys.exit(f'no RomFS.img in {work}/extract: build with --romfs separate first')
++    image = images[-1]; build = image.parent.name
++    ipa = (a.ipa or next(iter(sorted(a.nsp_dir.expanduser().glob('*.ipa'))), None))
++    expected = info = None; ipa_msl = set()
++    if ipa:
++        with zipfile.ZipFile(ipa) as z:
++            names = z.namelist()
++            idn = next((n for n in names if re.fullmatch(r'Payload/[^/]+\.app/romfs\.id', n)), None)
++            pl = next((n for n in names if re.fullmatch(r'Payload/[^/]+\.app/Info\.plist', n)), None)
++            expected = z.read(idn).decode().strip() if idn else None
++            info = plistlib.loads(z.read(pl)) if pl else {}
++            ipa_msl = {m.group(1) for n in names if (m := re.fullmatch(r'Payload/[^/]+\.app/msl/(b-[^/]+/.+[^/])', n))}
++    version = (re.search(r'version=(\S+)', expected).group(1) if expected else None) or (info or {}).get('CFBundleShortVersionString') or build
++    identity = subprocess.run([sys.executable, '-I', str(REPO / 'dm/tools/romfs_image.py'), '--identity', str(image), title, version, build],
++                              check=True, capture_output=True, text=True).stdout.strip()
++    key = lambda s: sorted(t for t in s.split() if t.startswith(('size=', 'index=')))
++    if expected and key(expected) != key(identity): sys.exit(f'{ipa.name} needs another image:\n  app:   {expected}\n  image: {identity}\nrebuild the IPA, or publish the matching build')
++
++    dest = a.out / 'data' / title / build
++    print(f'{title} {version} ({build}) → {dest}')
++    place(image, dest / 'romfs.img', a.copy)
++    print(f'  romfs.img  {image.stat().st_size / 1e9:.2f} GB, hashing…')
++    manifest = dict(format=1, title=title, name=(info or {}).get('CFBundleDisplayName'), version=version, build=build,
++                    published=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
++                    romfs=part(dest / 'romfs.img', f'{build}/romfs.img', identity=identity))
++    if not a.no_shaders:
++        libs = sorted(p for p in (work / 'shader' / 'ios').glob('b-*') if p.is_dir())   # not b-<version>.key, the cache key beside it
++        if not libs:   # a Vulkan or OpenGL game: its shaders are one library inside the IPA (build_ipa.sh), nothing to publish
++            if not (work / 'shader' / 'ios').exists(): sys.exit(f'no shader libraries in {work}/shader/ios (or pass --no-shaders)')
++            print('  shaders    none to publish: this game\'s shader library travels inside its IPA')
++    if not a.no_shaders and libs:
++        tar = dest / 'msl.tar'
++        # the same files the IPA carries: its own list when it has one (a default build), else build_ipa.sh's rule for the pulling-vertex libraries
++        rel = lambda p: str(p.relative_to(libs[-1].parent))
++        keep = (lambda p: rel(p) in ipa_msl) if ipa_msl else (lambda p: a.with_pull_libs or not p.name.endswith('_bp.metallib'))
++        print(f'  msl.tar    {libs[-1].name}, packing{" the IPA\'s " + str(len(ipa_msl)) + " files" if ipa_msl else ""}…'); ustar(libs[-1], tar, keep)
++        manifest['shaders'] = part(tar, f'{build}/msl.tar', dir=libs[-1].name)
++        if not any(keep(p) and p.suffix == '.metallib' for p in libs[-1].iterdir()): sys.exit(f'{tar} is empty: {libs[-1]} holds no shader libraries')   # by count, not size: a game with few shaders packs to under 1 MB
++        print(f'             {tar.stat().st_size / 1e9:.2f} GB')
++    # manifest URLs are relative to the manifest: the per-build copy sits beside its files, the latest one a folder above
++    (dest / 'manifest.json').write_text(json.dumps(dict(manifest, romfs=dict(manifest['romfs'], url='romfs.img'),
++        **({'shaders': dict(manifest['shaders'], url='msl.tar')} if 'shaders' in manifest else {})), indent=1))
++    (dest.parent / 'manifest.json').write_text(json.dumps(manifest, indent=1))
++    print(f'  manifests  {dest / "manifest.json"}, {dest.parent / "manifest.json"}')
++
++    if ipa and a.base_url:
++        bv = info.get('CFBundleVersion', '0')
++        ipa_dst = a.out / 'ipa' / title / f'{build}-{bv}.ipa'; place(ipa, ipa_dst, True)
++        icon = image.parent / 'icon.jpg'   # the game's own icon, as the build saved it from the NSP's control data
++        icon_url = None
++        if icon.exists():
++            place(icon, a.out / 'ipa' / title / 'icon.jpg', True)
++            icon_url = f'{a.base_url.rstrip("/")}/ipa/{title}/icon.jpg'
++        src = a.out / 'source.json'
++        s = json.loads(src.read_text()) if src.exists() else dict(name='NX2Apple games', identifier='local.nx2apple.games', apps=[])
++        bid = info.get('CFBundleIdentifier', f'org.nxnative.{title.lower()}')
++        app = next((x for x in s['apps'] if x.get('bundleIdentifier') == bid), None)
++        if not app: app = dict(name=info.get('CFBundleDisplayName', title), bundleIdentifier=bid, developerName='NX2Apple (your build)', localizedDescription=f'Your build of {title}. Game data: {a.base_url.rstrip("/")}/data', versions=[]); s['apps'].append(app)
++        if icon_url: app['iconURL'] = icon_url   # the server's index step adds the token, as it does to downloadURL
++        app['versions'] = [v for v in app['versions'] if v.get('buildVersion') != bv]
++        app['versions'].insert(0, dict(version=info.get('CFBundleShortVersionString', version), buildVersion=bv, date=manifest['published'],
++                                       downloadURL=f'{a.base_url.rstrip("/")}/ipa/{title}/{ipa_dst.name}', size=ipa_dst.stat().st_size, minOSVersion=info.get('MinimumOSVersion', '26.0')))
++        src.write_text(json.dumps(s, indent=1))
++        print(f'  ipa        {ipa_dst} (source.json updated)')
++    print(f'done. In the app: Game data server = {(a.base_url or "https://<your server>").rstrip("/")}/data')
++
++
++if __name__ == '__main__':
++    main()
