@@ -16,6 +16,7 @@ public struct GameDetailView: View {
         self.showsPrimaryAction = showsPrimaryAction
         self.showsHeader = showsHeader
     }
+    @State private var confirmingRemove = false
     public var body: some View {
         VStack(alignment: .leading, spacing: 30) {
             if showsHeader || showsPrimaryAction { header }
@@ -74,7 +75,19 @@ public struct GameDetailView: View {
                 Text(ShellStrings.text("Brings back the settings this game was tested with."))
                     .shellText(12.5).foregroundStyle(.white.opacity(0.45)).fixedSize(horizontal: false, vertical: true)
             }
-            if let askDelete {
+            if detail.removable {
+                VStack(alignment: .leading, spacing: 10) {
+                    Button(ShellStrings.text("Remove from this phone"), role: .destructive) { confirmingRemove = true }
+                        .buttonStyle(ShellButtonStyle(fills: true, destructive: true))
+                        .accessibilityIdentifier("set.remove")
+                        .shellTarget("set.remove") { confirmingRemove = true }
+                    Text(ShellStrings.text("Deletes its game code and data to free space. Your saves stay, and you can download it again."))
+                        .shellText(12.5).foregroundStyle(.white.opacity(0.45)).fixedSize(horizontal: false, vertical: true)
+                }
+                .confirmationDialog(ShellStrings.text("Remove \(detail.game.title)?"), isPresented: $confirmingRemove, titleVisibility: .visible) {
+                    Button(ShellStrings.text("Remove"), role: .destructive) { actions.onRemove(detail.id) }
+                } message: { Text(ShellStrings.text("Your saves stay, and you can download it again.")) }
+            } else if let askDelete {
                 // Last and apart from the rest: the one action here that removes something. It only asks, the question names what goes.
                 VStack(alignment: .leading, spacing: 10) {
                     Button(ShellStrings.text("Delete game…")) { askDelete(detail.game) }

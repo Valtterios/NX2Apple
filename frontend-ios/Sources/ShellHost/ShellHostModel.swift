@@ -69,6 +69,9 @@ public struct ShellHostConfig: Sendable {
     @ObservationIgnored public var serverState: ((_ id: String, _ local: GameState?) -> GameState?)?
     /// The primary action of a game in a `.server` state.
     @ObservationIgnored public var onServerAction: ((String) -> Void)?
+    /// Whether the host can remove a game from the device, and doing it: Remove in its settings.
+    @ObservationIgnored public var canRemove: ((String) -> Bool)?
+    @ObservationIgnored public var onRemove: ((String) -> Void)?
 
     @ObservationIgnored private let config: ShellHostConfig
     @ObservationIgnored private let launcher: any GameLauncher
@@ -240,6 +243,12 @@ public struct ShellHostConfig: Sendable {
     }
 
     private func detail(for entry: CatalogueEntry) -> GameDetail {
+        var d = baseDetail(for: entry)
+        d.removable = canRemove?(entry.id) ?? false
+        return d
+    }
+
+    private func baseDetail(for entry: CatalogueEntry) -> GameDetail {
         let data = data(for: entry)
         let resolved = GameStateResolver.state(for: entry, data: data, environment: config.environment)
         let state = serverState?(entry.id, resolved) ?? resolved
@@ -303,7 +312,7 @@ public struct ShellHostConfig: Sendable {
 
     /// The closures for `LibraryView`.
     public var actions: ShellActions {
-        ShellActions(
+        var actions = ShellActions(
             onPlay: { [weak self] id in self?.play(id) },
             onChange: { [weak self] id, setting, value in self?.change(id, setting: setting, value: value) },
             onPickGameData: { [weak self] id in self?.pickGameData(id) },
@@ -328,6 +337,8 @@ public struct ShellHostConfig: Sendable {
             onButtonTest: { [weak self] open in self?.buttonTest(open) },
             onDeleteGame: { [weak self] id, saves in self?.deleteGame(id, saves: saves) },
             onServerAction: { [weak self] id in self?.onServerAction?(id) })
+        actions.onRemove = { [weak self] id in self?.onRemove?(id) }
+        return actions
     }
 
     public func change(_ id: String, setting: String, value: String) {
