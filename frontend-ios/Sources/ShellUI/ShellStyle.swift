@@ -333,12 +333,13 @@ extension GameState {
         case .needsGameData: ShellStrings.text("Needs game data")
         case .needsAppUpdate: ShellStrings.text("App update needed")
         case .broken(let reason, _, _): reason.isEmpty ? ShellStrings.text("Unavailable") : reason
+        case .server(let status, _, _, _): status
         }
     }
     var color: Color {
         switch self {
         case .playable: ShellPalette.ready
-        case .needsGameData, .needsAppUpdate: ShellPalette.attention
+        case .needsGameData, .needsAppUpdate, .server: ShellPalette.attention
         case .broken: ShellPalette.muted
         }
     }
@@ -348,6 +349,7 @@ extension GameState {
         case .needsGameData: ShellStrings.text("Choose this game's data to get ready to play.")
         case .needsAppUpdate: ShellStrings.text("Install a newer version of this app to play this game.")
         case .broken(_, let detail, _): detail
+        case .server(_, let detail, _, _): detail
         }
     }
     var actionTitle: String {
@@ -356,6 +358,7 @@ extension GameState {
         case .needsGameData: ShellStrings.text("Choose game data…")
         case .needsAppUpdate: ShellStrings.text("How to update")
         case .broken: ShellStrings.text("How to fix")
+        case .server(_, _, let action, _): action
         }
     }
     var actionSymbol: String {
@@ -364,6 +367,7 @@ extension GameState {
         case .needsGameData: "folder"
         case .needsAppUpdate: "arrow.up.circle"
         case .broken: "wrench.and.screwdriver"
+        case .server(_, _, _, let symbol): symbol
         }
     }
 }
@@ -446,6 +450,7 @@ extension GameState {
         case .needsGameData: ShellStrings.text("Choose")
         case .needsAppUpdate: ShellStrings.text("How to update")
         case .broken: ShellStrings.text("How to fix")
+        case .server(_, _, let action, _): action
         }
     }
     /// Broken and needs-an-update are fixed on the Mac. Their primary action explains how, instead of acting.

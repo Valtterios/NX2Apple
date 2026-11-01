@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 21:00:46 +0200
+Subject: [PATCH] Shell: the server's games in the library, downloaded from
+ their own page
+
+Every game of the server's catalogue is in the library; its state (not downloaded, downloading, an update, data missing, Force Sign
+needed) and primary action come from ShellStore. Force Sign is asked for once both the code and the data are in, a stopped download
+resumes, and downloaded games are kept outside the bundle (Library/ShellGames) and restored after an app update.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the shell's server games in its library (patch 0057)
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-upstream)
+
+---
+ dm/ios/Shell/ShellApp.swift   |   6 +-
+ dm/ios/Shell/ShellStore.swift | 150 +++++++++++++++++++++++++++++-----
+ 2 files changed, 134 insertions(+), 22 deletions(-)
+
+diff --git a/dm/ios/Shell/ShellApp.swift b/dm/ios/Shell/ShellApp.swift
+index d1e7f6f..a2caaee 100644
+--- a/dm/ios/Shell/ShellApp.swift
++++ b/dm/ios/Shell/ShellApp.swift
+@@ -50,6 +50,7 @@ private func withCStrings<R>(_ strings: [String], _ body: (UnsafePointer<UnsafeP
+         let info = Bundle.main.infoDictionary ?? [:]
+         // The shader chain the host was compiled with (build_shell.sh writes DMChain): a framework built for another one needs an app update
+         let chain = (info["DMChain"] as? String).map { "b-" + $0 }
++        ShellStore.restoreKept()   // games downloaded before an app update, back into the new bundle
+         let frameworks = Bundle.main.privateFrameworksURL ?? Bundle.main.bundleURL.appendingPathComponent("Frameworks", isDirectory: true)
+         let config = ShellHostConfig(gamesRoot: frameworks, appDataRoot: ShellHostConfig.defaultAppDataRoot(),
+                                      environment: HostEnvironment(chain: chain),
+@@ -66,7 +67,7 @@ private func withCStrings<R>(_ strings: [String], _ body: (UnsafePointer<UnsafeP
+             fputs("shell: DM_SHELL_PLAY=\(id) (\(state))\n", stderr)
+             DispatchQueue.main.async { model.play(id) }
+         }
+-        let store = ShellStore(chain: chain) { model.reload() }
++        let store = ShellStore(chain: chain, model: model)
+         let host = UIHostingController(rootView: ShellRoot(model: model, store: store))
+         host.view.backgroundColor = .black
+         return host
+@@ -86,6 +87,7 @@ struct ShellRoot: View {
+                                                           label: store.needsSigning.isEmpty ? "Get games" : "Get games, Force Sign needed",
+                                                           attention: !store.needsSigning.isEmpty) { getting = true })
+             .sheet(isPresented: $getting, onDismiss: { model.reload() }) { ShellStoreView(store: store) }
+-            .onAppear { if model.entries.isEmpty { getting = true } }
++            // The server's games join the library at start; with no token yet, Get games asks for it
++            .task { if store.token.isEmpty { getting = true } else { await store.load() } }
+     }
+ }
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index c704835..8a7d075 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -5,6 +5,9 @@
+ // screen says when, by reading the framework's own code signature.
+ import Foundation
+ import SwiftUI
++import UIKit
++import ShellHost
++import ShellUI
+ 
+ struct ShellCatalogue: Decodable {
+     struct Game: Decodable, Identifiable {
+@@ -96,12 +99,95 @@ func untar(_ tar: URL, into dir: URL) throws {
+     @Published var busy: String?   // the title ID being installed
+     @Published var progress = ""
+     let chain: String?
+-    let onChange: () -> Void
++    let model: ShellHostModel
+ 
+-    init(chain: String?, onChange: @escaping () -> Void) {
+-        self.chain = chain; self.onChange = onChange
++    init(chain: String?, model: ShellHostModel) {
++        self.chain = chain; self.model = model
+         server = UserDefaults.standard.string(forKey: "gamedata.server") ?? "https://games.auraserver.eu/data"
+         token = UserDefaults.standard.string(forKey: "gamedata.token") ?? ""
++        // The server's games in the library itself: their state and primary action come from here
++        model.serverState = { [weak self] id, local in self?.state(id, local: local) }
++        model.onServerAction = { [weak self] id in self?.action(id) }
++    }
++
++    func game(_ id: String) -> ShellCatalogue.Game? { catalogue?.games.first { $0.id == id } }
++
++    /// What the library shows for a server game: not downloaded, downloading, an update, its data missing, Force Sign needed; nil
++    /// once it is ready (the catalogue's own state, Play)
++    func state(_ id: String, local: GameState?) -> GameState? {
++        guard let g = game(id) else { return nil }
++        let size = ByteCountFormatter.string(fromByteCount: g.framework.size, countStyle: .file)
++        if busy == id { return .server(status: "Downloading", detail: progress, action: "Downloading…", symbol: "arrow.down.circle") }
++        guard let have = installedBuild(id) else {
++            return .server(status: "Not downloaded", detail: "Downloads \(size) of game code and the game's data from your server. Keep the app open while it downloads.",
++                           action: "Download", symbol: "arrow.down.circle")
++        }
++        if have != g.build {
++            return .server(status: "Update available", detail: "Version \(g.version) is on your server.", action: "Update", symbol: "arrow.down.circle")
++        }
++        if !dataReady(id) {
++            return .server(status: "Game data missing", detail: "The game's data did not finish downloading. Download resumes where it stopped.",
++                           action: "Download data", symbol: "arrow.down.circle")
++        }
++        if frameworkSignature(executable(id)) != .certificate {
++            return .server(status: "Force Sign needed", detail: Self.forceSignHelp, action: "How to Force Sign", symbol: "signature")
++        }
++        return nil
++    }
++    static let forceSignHelp = "Close this app, open its settings in LiveContainer and tap Force Sign, then open this app again. Needed once after each download or app update."
++
++    func action(_ id: String) {
++        guard let g = game(id) else { return }
++        if let b = busy { model.notice = b == id ? "\(g.name) is downloading: keep the app open." : "Another game is downloading. Wait for it to finish."; return }
++        if installedBuild(id) == g.build && dataReady(id) && frameworkSignature(executable(id)) != .certificate { model.notice = Self.forceSignHelp; return }
++        Task { await install(g) }
++    }
++
++    /// Shows the progress in the library (in place, no re-sorting)
++    func showProgress(_ text: String) { progress = text; model.refreshAll() }
++
++    /// The server's games for the library, with a local copy of each icon (the server asks for the token, the library reads files)
++    func publishToLibrary() async {
++        guard let cat = catalogue, let base = servers.first else { return }
++        let icons = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("shell-icons", isDirectory: true)
++        try? FileManager.default.createDirectory(at: icons, withIntermediateDirectories: true)
++        let sync = GameDataSync(servers: servers, token: token, gameDir: icons)
++        var games: [ServerGame] = []
++        for g in cat.games {
++            var icon: URL?
++            if let rel = g.icon {
++                let local = icons.appendingPathComponent("\(g.id).\((rel as NSString).pathExtension)")
++                if !FileManager.default.fileExists(atPath: local.path),
++                   let url = URL(string: rel, relativeTo: base.appendingPathComponent("shell/catalog.json")),
++                   let (data, resp) = try? await URLSession.shared.data(for: sync.request(url.absoluteURL)), (resp as? HTTPURLResponse)?.statusCode == 200 {
++                    try? data.write(to: local)
++                }
++                if FileManager.default.fileExists(atPath: local.path) { icon = local }
++            }
++            games.append(ServerGame(id: g.id, title: g.name, subtitle: "Version \(g.version)", iconURL: icon))
++        }
++        model.serverGames = games
++    }
++
++    /// The kept copies, outside the app bundle: an app update replaces the bundle (and the frameworks in it), not Library/
++    static var kept: URL { FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("ShellGames", isDirectory: true) }
++
++    /// Puts back every kept game the bundle lacks (after an app update), as APFS clones: no second copy on the disk. Runs before the
++    /// library reads the Frameworks folder; a restored framework needs Force Sign again, as after a download.
++    static func restoreKept() {
++        let fm = FileManager.default
++        let frameworks = Bundle.main.privateFrameworksURL ?? Bundle.main.bundleURL.appendingPathComponent("Frameworks", isDirectory: true)
++        guard fm.isWritableFile(atPath: Bundle.main.bundlePath),
++              let names = try? fm.contentsOfDirectory(atPath: kept.path) else { return }
++        for name in names where name.hasSuffix(".framework") {
++            let src = kept.appendingPathComponent(name), dst = frameworks.appendingPathComponent(name)
++            let want = try? String(contentsOf: src.appendingPathComponent("shell-build.txt"), encoding: .utf8)
++            if fm.fileExists(atPath: dst.path), (try? String(contentsOf: dst.appendingPathComponent("shell-build.txt"), encoding: .utf8)) == want { continue }
++            try? fm.removeItem(at: dst)
++            try? fm.createDirectory(at: frameworks, withIntermediateDirectories: true)
++            do { try fm.copyItem(at: src, to: dst); fputs("shell: restored \(name) from the kept copy\n", stderr) }
++            catch { fputs("shell: could not restore \(name): \(error.localizedDescription)\n", stderr) }
++        }
+     }
+ 
+     var frameworks: URL { Bundle.main.privateFrameworksURL ?? Bundle.main.bundleURL.appendingPathComponent("Frameworks", isDirectory: true) }
+@@ -114,8 +200,17 @@ func untar(_ tar: URL, into dir: URL) throws {
+         let m = frameworks.appendingPathComponent("DmGame\(id).framework/shell-build.txt")
+         return (try? String(contentsOf: m, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+     }
++    /// The game's romfs.img is in place and complete: the size its framework's manifest names (romfs_identity size=)
++    func dataReady(_ id: String) -> Bool {
++        let m = frameworks.appendingPathComponent("DmGame\(id).framework/game.manifest.json")
++        guard let d = try? Data(contentsOf: m), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
++              let line = j["romfs_identity"] as? String, let want = romfsIdentityField(line, "size").flatMap({ Int64($0) }) else { return false }
++        let have = (try? FileManager.default.attributesOfItem(atPath: gameDir(id).appendingPathComponent("romfs.img").path)[.size] as? NSNumber)?.int64Value
++        return have == want
++    }
++    /// Downloaded completely (code and data) and not signed yet: what Force Sign is for
+     var needsSigning: [String] {
+-        (catalogue?.games ?? []).map(\.id).filter { installedBuild($0) != nil && frameworkSignature(executable($0)) != .certificate }
++        (catalogue?.games ?? []).map(\.id).filter { installedBuild($0) != nil && dataReady($0) && frameworkSignature(executable($0)) != .certificate }
+     }
+ 
+     func load() async {
+@@ -130,6 +225,7 @@ func untar(_ tar: URL, into dir: URL) throws {
+                 guard code == 200 else { last = "HTTP \(code) from \(s.host ?? "")"; continue }
+                 catalogue = try JSONDecoder().decode(ShellCatalogue.self, from: data)
+                 status = ""
++                await publishToLibrary()
+                 return
+             }
+             throw GameDataError.server("No game list on the server (\(last)).")
+@@ -137,53 +233,65 @@ func untar(_ tar: URL, into dir: URL) throws {
+     }
+ 
+     func install(_ g: ShellCatalogue.Game) async {
+-        busy = g.id; progress = "Starting"; defer { busy = nil; progress = "" }
++        busy = g.id; progress = "Starting"
++        UIApplication.shared.isIdleTimerDisabled = true   // the screen stays on: leaving the app stops the download (it resumes on the next Get)
++        model.refreshAll()
++        defer { busy = nil; progress = ""; UIApplication.shared.isIdleTimerDisabled = false; model.reload() }
+         do {
+             guard let base = servers.first?.appendingPathComponent("shell/catalog.json") else { throw GameDataError.local("No server address") }
+             if let c = chain, let cat = catalogue, cat.chain != c {
+                 throw GameDataError.mismatch("The server's games are built for shader chain \(cat.chain) and this app for \(c): the app needs an update.")
+             }
+             guard bundleWritable else { throw GameDataError.local("This app cannot add games here: run it in LiveContainer, whose app folder is writable.") }
+-            // 1. the framework, a tar fetched with the game data's resumable, checked download, unpacked over any older copy
++            // 1. the framework, a tar fetched with the game data's resumable, checked download (kept in Caches until the data is in too)
++            let codeCurrent = installedBuild(g.id) == g.build
+             let staging = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("shell-downloads/\(g.id)", isDirectory: true)
+             let fsync = GameDataSync(servers: servers, token: token, gameDir: staging)
+             let watch = Task { @MainActor in
+                 while !Task.isCancelled {
+                     let p = fsync.progress
+-                    progress = "Game code: \(p.phase) \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%"
++                    showProgress("Game code: \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%")
+                     try? await Task.sleep(for: .milliseconds(500))
+                 }
+             }
+-            try await fsync.syncFile(g.framework, base: base, name: "framework.tar")
++            if !codeCurrent { try await fsync.syncFile(g.framework, base: base, name: "framework.tar") }
+             watch.cancel()
+-            progress = "Unpacking"
+-            let fw = frameworks.appendingPathComponent("DmGame\(g.id).framework")
+-            try? FileManager.default.removeItem(at: fw)
+-            try FileManager.default.createDirectory(at: frameworks, withIntermediateDirectories: true)
+-            try untar(staging.appendingPathComponent("framework.tar"), into: frameworks)
+-            try g.build.write(to: fw.appendingPathComponent("shell-build.txt"), atomically: true, encoding: .utf8)
+-            try? FileManager.default.removeItem(at: staging)
+             // 2. the game data, as the per-game app downloads it (romfs.img only: the shader libraries are inside the framework)
+             let dsync = GameDataSync(servers: servers, token: token, gameDir: gameDir(g.id))
+             let (m, url) = try await dsync.manifest(title: g.id, build: g.build)
+             let watch2 = Task { @MainActor in
+                 while !Task.isCancelled {
+                     let p = dsync.progress
+-                    progress = "Game data: \(p.phase) \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%"
++                    showProgress("Game data: \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%")
+                     try? await Task.sleep(for: .milliseconds(500))
+                 }
+             }
+             try await dsync.syncFile(m.romfs, base: url, name: "romfs.img")
+             watch2.cancel()
+-            onChange()
+-            status = "\(g.name) is downloaded. Before playing it: open LiveContainer, open this app's settings and tap Force Sign, then start the app again."
++            // 3. both in: the framework goes into the app, over any older copy, and only now asks for Force Sign
++            if !codeCurrent {
++                progress = "Unpacking"
++                let fm = FileManager.default, name = "DmGame\(g.id).framework"
++                let keep = Self.kept.appendingPathComponent(name), fw = frameworks.appendingPathComponent(name)
++                try? fm.removeItem(at: keep)
++                try fm.createDirectory(at: Self.kept, withIntermediateDirectories: true)
++                try untar(staging.appendingPathComponent("framework.tar"), into: Self.kept)
++                try g.build.write(to: keep.appendingPathComponent("shell-build.txt"), atomically: true, encoding: .utf8)
++                try? fm.removeItem(at: fw)
++                try fm.createDirectory(at: frameworks, withIntermediateDirectories: true)
++                try fm.copyItem(at: keep, to: fw)   // an APFS clone of the kept copy: it survives app updates (restoreKept)
++                try? fm.removeItem(at: staging)
++            }
++            status = frameworkSignature(executable(g.id)) == .certificate ? "\(g.name) is ready to play."
++                : "\(g.name) is downloaded. Before playing it: close this app, open its settings in LiveContainer and tap Force Sign, then start this app again."
+         } catch { status = "\(g.name): \(error.localizedDescription)" }
+     }
+ 
+     func remove(_ g: ShellCatalogue.Game) {
+         try? FileManager.default.removeItem(at: frameworks.appendingPathComponent("DmGame\(g.id).framework"))
++        try? FileManager.default.removeItem(at: Self.kept.appendingPathComponent("DmGame\(g.id).framework"))
+         try? GameDataSync(servers: [], token: "", gameDir: gameDir(g.id)).deleteGameData()   // the saves stay
+-        onChange(); objectWillChange.send()
++        model.reload(); objectWillChange.send()
+     }
+ }
+ 
+@@ -237,7 +345,9 @@ struct ShellStoreView: View {
+                 }
+                 Spacer()
+                 if store.busy == g.id { ProgressView() }
+-                else if have == g.build {
++                else if have == g.build && !store.dataReady(g.id) {
++                    Button("Get data") { Task { await store.install(g) } }.buttonStyle(.borderedProminent).disabled(store.busy != nil)
++                } else if have == g.build {
+                     Text(frameworkSignature(store.executable(g.id)) == .certificate ? "Ready" : "Needs Force Sign")
+                         .font(.caption).foregroundStyle(frameworkSignature(store.executable(g.id)) == .certificate ? .green : .orange)
+                 } else {
