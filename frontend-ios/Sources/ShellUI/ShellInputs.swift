@@ -9,6 +9,9 @@ public enum GameState: Equatable, Sendable {
     /// for the player (what happened, what to do), shown under the title and in the How to fix sheet. `technical`
     /// is the underlying message, shown only as small secondary Details in the sheet.
     case broken(reason: String, detail: String = "", technical: String = "")
+    /// A game the host gets from elsewhere (the shell's game server): its own status line, explanation, primary action and its
+    /// symbol, all localized by the host. The primary action calls `ShellActions.onServerAction`.
+    case server(status: String, detail: String, action: String, symbol: String)
 }
 
 public struct GameTile: Identifiable, Equatable, Sendable {
@@ -186,6 +189,7 @@ public struct ShellActions {
     public var onUseShellCloud: (String) -> Void
     public var onClearShellData: () -> Void
     public var onClearShellCloud: () -> Void
+    public var onServerAction: (String) -> Void
     public init(onSelect: @escaping (String) -> Void = { _ in }, onPlay: @escaping (String) -> Void = { _ in },
                 onChange: @escaping (String, String, String) -> Void = { _, _, _ in },
                 onPickGameData: @escaping (String) -> Void = { _ in }, onUseAppData: @escaping (String) -> Void = { _ in },
@@ -194,7 +198,8 @@ public struct ShellActions {
                 onAppUpdate: @escaping () -> Void = {}, onBack: @escaping () -> Void = {},
                 onPickShellData: @escaping () -> Void = {}, onPickShellCloud: @escaping () -> Void = {},
                 onUseShellCloud: @escaping (String) -> Void = { _ in }, onClearShellData: @escaping () -> Void = {},
-                onClearShellCloud: @escaping () -> Void = {}) {
+                onClearShellCloud: @escaping () -> Void = {}, onServerAction: @escaping (String) -> Void = { _ in }) {
+        self.onServerAction = onServerAction
         self.onSelect = onSelect
         self.onPlay = onPlay
         self.onChange = onChange

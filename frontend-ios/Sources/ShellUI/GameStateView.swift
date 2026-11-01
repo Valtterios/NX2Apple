@@ -43,6 +43,7 @@ public struct GameStateView: View {
         case .needsGameData: actions.onPickGameData(game.id)
         case .needsAppUpdate: actions.onAppUpdate()
         case .broken: actions.onShowLog(game.id)
+        case .server: actions.onServerAction(game.id)
         }
     }
 }

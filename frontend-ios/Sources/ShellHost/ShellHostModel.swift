@@ -58,6 +58,15 @@ public struct ShellHostConfig: Sendable {
     /// The log the host view shows in a read-only sheet.
     public var log: LogPresentation?
 
+    /// Games the host can get from elsewhere (the shell's game server, dm/ios/Shell/ShellStore.swift): listed in the library
+    /// beside the installed ones until they are installed. Setting it re-reads the library.
+    public var serverGames: [ServerGame] = [] { didSet { reload() } }
+    /// A game's state as the server side sees it (not downloaded, downloading, data missing, Force Sign needed), over the
+    /// state the catalogue gives (nil for a game the catalogue does not hold). Nil keeps the catalogue's state.
+    @ObservationIgnored public var serverState: ((_ id: String, _ local: GameState?) -> GameState?)?
+    /// The primary action of a game in a `.server` state.
+    @ObservationIgnored public var onServerAction: ((String) -> Void)?
+
     @ObservationIgnored private let config: ShellHostConfig
     @ObservationIgnored private let launcher: any GameLauncher
     @ObservationIgnored private let picker: any FolderPicker
@@ -102,7 +111,21 @@ public struct ShellHostConfig: Sendable {
     public func refreshAll() {
         shellChoices = Self.choices(of: shellSettings)
         startShellScan()
-        details = entries.map(detail(for:))
+        rebuildDetails()
+    }
+
+    /// The installed games and the server's, in the order they had (a new one goes at the end).
+    private func rebuildDetails() {
+        let fresh = Dictionary(uniqueKeysWithValues: (entries.map(detail(for:)) + serverDetails()).map { ($0.id, $0) })
+        details = details.compactMap { fresh[$0.id] } + fresh.values.filter { f in !details.contains { $0.id == f.id } }
+    }
+
+    /// The server's games that are not installed, as library entries in their `.server` state.
+    private func serverDetails() -> [GameDetail] {
+        serverGames.filter { g in !entries.contains { $0.id == g.id } }.map { g in
+            let state = serverState?(g.id, nil) ?? .server(status: hostText("Not downloaded"), detail: "", action: hostText("Download"), symbol: "arrow.down.circle")
+            return GameDetail(game: GameTile(id: g.id, title: g.title, subtitle: g.subtitle, icon: image(g.iconURL), state: state))
+        }
     }
 
     /// Looks for every game's image by identity in the shell data folder. The drive is read off the main actor: until the scan is
@@ -131,7 +154,7 @@ public struct ShellHostConfig: Sendable {
             }.value
             guard let self, !Task.isCancelled, self.scannedShellFolder == folder.path else { return }
             self.shellMatches = found
-            if !found.isEmpty { self.details = self.entries.map(self.detail(for:)) }
+            if !found.isEmpty { self.rebuildDetails() }
         }
     }
 
@@ -148,7 +171,8 @@ public struct ShellHostConfig: Sendable {
     /// a change to one game updates it in place.
     public func reload() {
         let scanned = GameCatalogue.scan(root: config.gamesRoot)
-        let built = scanned.map(detail(for:))
+        entries = scanned
+        let built = scanned.map(detail(for:)) + serverDetails()
         let order = LibraryOrder.ids(of: built.map(\.game), lastPlayed: Dictionary(uniqueKeysWithValues: scanned.compactMap { e in
             lastPlayed(e.id).map { (e.id, $0) } }))
         let position = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
@@ -213,7 +237,8 @@ public struct ShellHostConfig: Sendable {
 
     private func detail(for entry: CatalogueEntry) -> GameDetail {
         let data = data(for: entry)
-        let state = GameStateResolver.state(for: entry, data: data, environment: config.environment)
+        let resolved = GameStateResolver.state(for: entry, data: data, environment: config.environment)
+        let state = serverState?(entry.id, resolved) ?? resolved
         let played = lastPlayed(entry.id)
         let tile = GameTile(id: entry.id, title: entry.title, subtitle: entry.manifest.map { ShellFormat.version($0.displayVersion) } ?? "",
                             banner: image(entry.bannerURL), icon: image(entry.iconURL), state: state,
@@ -284,7 +309,8 @@ public struct ShellHostConfig: Sendable {
             onPickShellCloud: { [weak self] in self.map { model in Task { await model.pickShellCloudNow() } } },
             onUseShellCloud: { [weak self] id in self?.useShellCloudSaves(id) },
             onClearShellData: { [weak self] in self?.clearShellData() },
-            onClearShellCloud: { [weak self] in self?.clearShellCloud() })
+            onClearShellCloud: { [weak self] in self?.clearShellCloud() },
+            onServerAction: { [weak self] id in self?.onServerAction?(id) })
     }
 
     public func change(_ id: String, setting: String, value: String) {
@@ -437,5 +463,17 @@ public struct ShellHostConfig: Sendable {
 
     static func info(for c: ConnectedController) -> ControllerInfo {
         ControllerInfo(id: c.id, name: c.name, player: hostText("Player \(c.player)"), batteryPercent: c.batteryPercent, charging: c.charging)
+    }
+}
+
+/// A game on the shell's game server, for the library before it is installed.
+public struct ServerGame: Equatable, Sendable {
+    public var id: String
+    public var title: String
+    public var subtitle: String
+    /// A local copy of its icon.
+    public var iconURL: URL?
+    public init(id: String, title: String, subtitle: String = "", iconURL: URL? = nil) {
+        self.id = id; self.title = title; self.subtitle = subtitle; self.iconURL = iconURL
     }
 }
