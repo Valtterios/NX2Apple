@@ -105,6 +105,8 @@ public struct GameDetail: Identifiable, Equatable, Sendable {
     public var cloudFromShell: Bool
     /// The shell settings have a cloud-saves folder this game does not use now, so the game can follow it.
     public var cloudCanUseShell: Bool
+    /// The host can remove this game from the device (its code and data, not its saves): settings show Remove (`onRemove`).
+    public var removable = false
     public init(game: GameTile, sections: [SettingSection] = [], dataSource: String = "", dataNote: String = "",
                 cloudSaves: String? = nil, cloudNote: String = "", dlc: String = "", hasModifiedSettings: Bool = false,
                 dataFromShell: Bool = false, cloudFromShell: Bool = false, cloudCanUseShell: Bool = false) {
@@ -190,6 +192,7 @@ public struct ShellActions {
     public var onClearShellData: () -> Void
     public var onClearShellCloud: () -> Void
     public var onServerAction: (String) -> Void
+    public var onRemove: (String) -> Void = { _ in }
     public init(onSelect: @escaping (String) -> Void = { _ in }, onPlay: @escaping (String) -> Void = { _ in },
                 onChange: @escaping (String, String, String) -> Void = { _, _, _ in },
                 onPickGameData: @escaping (String) -> Void = { _ in }, onUseAppData: @escaping (String) -> Void = { _ in },
