@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:41:20 +0200
+Subject: [PATCH] publish_shell.py: the version players know (1.4.2) in the
+ catalogue, not the build (v393216)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the shell catalogue's display version (patch 0057)
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-upstream)
+---
+ scripts/publish_shell.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/publish_shell.py b/scripts/publish_shell.py
+index 6eb8d0b..c5df607 100644
+--- a/scripts/publish_shell.py
++++ b/scripts/publish_shell.py
+@@ -42,7 +42,9 @@ def main():
+         print(f'  {fw.name}: packing')
+         ustar(fw, tar)
+         icon = next((p for p in sorted(fw.glob('icon.*'))), None)
+-        entry = dict(id=tid, name=data.get('name') or m.get('name') or tid, version=data['version'], build=data['build'],
++        # the version as players know it (1.4.2), from the framework's manifest: the game data's manifest has only the build (v393216)
++        # when it was published without an IPA
++        entry = dict(id=tid, name=data.get('name') or m.get('name') or tid, version=m.get('display_version') or data['version'], build=data['build'],
+                      framework=part(tar, f'{tid}/{chain}/{tar.name}'))
+         if a.aoc and a.aoc.is_dir() and len(a.frameworks) == 1:
+             imgs = sorted(a.aoc.glob('*.img'))

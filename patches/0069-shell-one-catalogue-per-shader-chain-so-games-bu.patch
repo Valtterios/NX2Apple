@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:48:12 +0200
+Subject: [PATCH] Shell: one catalogue per shader chain, so games built with a
+ newer engine wait on the server for the app built with it
+
+publish_shell.py --chain-catalogue writes data/shell/catalog-<chain>.json and leaves catalog.json to the app already installed; the
+app reads its own chain's catalogue first and catalog.json after it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: moving the shell's games to a new engine without breaking the installed app while they are rebuilt
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-next)
+---
+ dm/ios/Shell/ShellStore.swift | 16 +++++++++++-----
+ scripts/publish_shell.py      |  7 ++++++-
+ 2 files changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index 6b92c9d..66ab205 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -122,6 +122,11 @@ func untar(_ tar: URL, into dir: URL) throws {
+         model.onRemove = { [weak self] id in if let self, let g = self.game(id), self.busy == nil { self.remove(g) } }
+     }
+ 
++    /// The catalogue this app's games come from: the one of its shader chain (catalog-<chain>.json), so games built with another
++    /// engine stay on the server beside it for the app built with that engine; a server with only catalog.json still works.
++    var catalogPath = "shell/catalog.json"
++    private var catalogPaths: [String] { (chain.map { ["shell/catalog-\($0).json"] } ?? []) + ["shell/catalog.json"] }
++
+     func game(_ id: String) -> ShellCatalogue.Game? { catalogue?.games.first { $0.id == id } }
+ 
+     /// What the library shows for a server game: not downloaded, downloading, an update, its data missing, Force Sign needed; nil
+@@ -170,7 +175,7 @@ func untar(_ tar: URL, into dir: URL) throws {
+             if let rel = g.icon {
+                 let local = icons.appendingPathComponent("\(g.id).\((rel as NSString).pathExtension)")
+                 if !FileManager.default.fileExists(atPath: local.path),
+-                   let url = URL(string: rel, relativeTo: base.appendingPathComponent("shell/catalog.json")),
++                   let url = URL(string: rel, relativeTo: base.appendingPathComponent(catalogPath)),
+                    let (data, resp) = try? await URLSession.shared.data(for: sync.request(url.absoluteURL)), (resp as? HTTPURLResponse)?.statusCode == 200 {
+                     try? data.write(to: local)
+                 }
+@@ -231,16 +236,17 @@ func untar(_ tar: URL, into dir: URL) throws {
+         do {
+             let sync = GameDataSync(servers: servers, token: token, gameDir: FileManager.default.temporaryDirectory)
+             var last = "no server address"
+-            for s in servers {
+-                let (data, resp) = try await URLSession.shared.data(for: sync.request(s.appendingPathComponent("shell/catalog.json")))
++            for s in servers { for path in catalogPaths {
++                let (data, resp) = try await URLSession.shared.data(for: sync.request(s.appendingPathComponent(path)))
+                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                 if code == 401 || code == 403 { throw GameDataError.server("The server refused access (HTTP \(code)): check the access token.") }
+                 guard code == 200 else { last = "HTTP \(code) from \(s.host ?? "")"; continue }
+                 catalogue = try JSONDecoder().decode(ShellCatalogue.self, from: data)
++                catalogPath = path
+                 status = ""
+                 await publishToLibrary()
+                 return
+-            }
++            } }
+             throw GameDataError.server("No game list on the server (\(last)).")
+         } catch { status = error.localizedDescription }
+     }
+@@ -251,7 +257,7 @@ func untar(_ tar: URL, into dir: URL) throws {
+         model.refreshAll()
+         defer { busy = nil; progress = ""; UIApplication.shared.isIdleTimerDisabled = false; model.reload() }
+         do {
+-            guard let base = servers.first?.appendingPathComponent("shell/catalog.json") else { throw GameDataError.local("No server address") }
++            guard let base = servers.first?.appendingPathComponent(catalogPath) else { throw GameDataError.local("No server address") }
+             if let c = chain, let cat = catalogue, cat.chain != c {
+                 throw GameDataError.mismatch("The server's games are built for shader chain \(cat.chain) and this app for \(c): the app needs an update.")
+             }
+diff --git a/scripts/publish_shell.py b/scripts/publish_shell.py
+index c5df607..ca785bb 100644
+--- a/scripts/publish_shell.py
++++ b/scripts/publish_shell.py
+@@ -9,6 +9,9 @@ Each framework (build_ipa_from_nsp.py --shell-framework) is packed as an uncompr
+     data/shell/<title ID>/aoc/<index>.img                          its add-on content (--aoc: the build's aoc/ folder), which the app puts
+                                                                    in Documents/games/<title ID>/aoc/ beside the game data
+     data/shell/catalog.json                                       every published game: name, version, build, the tar's size and chunk hashes
++    data/shell/catalog-<chain>.json                               the same, with --chain-catalogue: one catalogue per shader chain, so
++                                                                  games built with a newer engine wait beside the old ones for the app
++                                                                  built with it (the app reads its chain's catalogue first)
+ The game's data comes from the game's own manifest, data/<title ID>/<build>/manifest.json (publish_gamedata.py, with --no-shaders when the
+ game is only played in the shell: its shader libraries are in the framework). That manifest names the build and version listed here.
+ """
+@@ -23,10 +26,12 @@ def main():
+     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+     ap.add_argument('frameworks', nargs='+', type=Path, help='DmGame<title ID>.framework folders')
+     ap.add_argument('--out', type=Path, required=True, help="the server's root folder (data/ goes in it)")
++    ap.add_argument('--chain-catalogue', action='store_true', help="write catalog-<chain>.json, leaving catalog.json to the older app")
+     ap.add_argument('--aoc', type=Path, help="the add-on content folder of the (single) framework's build: <title ID>_build/aoc")
+     a = ap.parse_args()
+     shell = a.out / 'data' / 'shell'
+-    cat_path = shell / 'catalog.json'
++    first = json.loads((a.frameworks[0].expanduser() / 'game.manifest.json').read_text())
++    cat_path = shell / (f'catalog-{first["chain"]}.json' if a.chain_catalogue else 'catalog.json')
+     cat = json.loads(cat_path.read_text()) if cat_path.exists() else {'format': 1, 'chain': None, 'games': []}
+     for fw in a.frameworks:
+         fw = fw.expanduser().resolve()
