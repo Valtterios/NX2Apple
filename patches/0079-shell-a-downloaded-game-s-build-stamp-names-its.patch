@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:49:08 +0200
+Subject: [PATCH] Shell: a downloaded game's build stamp names its shader
+ chain, so after an app update with a new engine its code downloads again
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: moving the shell's games to a new engine (patch 0069)
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-next)
+---
+ dm/ios/Shell/ShellStore.swift | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index 66ab205..84c1d5d 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -127,6 +127,10 @@ func untar(_ tar: URL, into dir: URL) throws {
+     var catalogPath = "shell/catalog.json"
+     private var catalogPaths: [String] { (chain.map { ["shell/catalog-\($0).json"] } ?? []) + ["shell/catalog.json"] }
+ 
++    /// What a downloaded game's shell-build.txt holds: its build and the shader chain it was built for, so a game downloaded for
++    /// another engine (before an app update) is offered again as an update, and only its code downloads (the data is the same)
++    func stamp(_ g: ShellCatalogue.Game) -> String { "\(g.build) \(catalogue?.chain ?? chain ?? "")" }
++
+     func game(_ id: String) -> ShellCatalogue.Game? { catalogue?.games.first { $0.id == id } }
+ 
+     /// What the library shows for a server game: not downloaded, downloading, an update, its data missing, Force Sign needed; nil
+@@ -139,8 +143,9 @@ func untar(_ tar: URL, into dir: URL) throws {
+             return .server(status: "Not downloaded", detail: "Downloads \(size) of game code and the game's data from your server. Keep the app open while it downloads.",
+                            action: "Download", symbol: "arrow.down.circle")
+         }
+-        if have != g.build {
+-            return .server(status: "Update available", detail: "Version \(g.version) is on your server.", action: "Update", symbol: "arrow.down.circle")
++        if have != stamp(g) {
++            let detail = have.hasPrefix("\(g.build) ") || have == g.build ? "This app version needs the game's code again (\(size)); its data stays." : "Version \(g.version) is on your server."
++            return .server(status: "Update available", detail: detail, action: "Update", symbol: "arrow.down.circle")
+         }
+         if !dataReady(id) {
+             return .server(status: "Game data missing", detail: "The game's data did not finish downloading. Download resumes where it stopped.",
+@@ -263,7 +268,7 @@ func untar(_ tar: URL, into dir: URL) throws {
+             }
+             guard bundleWritable else { throw GameDataError.local("This app cannot add games here: run it in LiveContainer, whose app folder is writable.") }
+             // 1. the framework, a tar fetched with the game data's resumable, checked download (kept in Caches until the data is in too)
+-            let codeCurrent = installedBuild(g.id) == g.build
++            let codeCurrent = installedBuild(g.id) == stamp(g)
+             let staging = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("shell-downloads/\(g.id)", isDirectory: true)
+             let fsync = GameDataSync(servers: servers, token: token, gameDir: staging)
+             let watch = Task { @MainActor in
+@@ -299,7 +304,7 @@ func untar(_ tar: URL, into dir: URL) throws {
+                 try? fm.removeItem(at: keep)
+                 try fm.createDirectory(at: Self.kept, withIntermediateDirectories: true)
+                 try untar(staging.appendingPathComponent("framework.tar"), into: Self.kept)
+-                try g.build.write(to: keep.appendingPathComponent("shell-build.txt"), atomically: true, encoding: .utf8)
++                try stamp(g).write(to: keep.appendingPathComponent("shell-build.txt"), atomically: true, encoding: .utf8)
+                 try? fm.removeItem(at: fw)
+                 try fm.createDirectory(at: frameworks, withIntermediateDirectories: true)
+                 try fm.copyItem(at: keep, to: fw)   // an APFS clone of the kept copy: it survives app updates (restoreKept)

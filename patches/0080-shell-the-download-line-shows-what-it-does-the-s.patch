@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:59:00 +0200
+Subject: [PATCH] Shell: the download line shows what it does, the size, the
+ speed and the time left; game data checked once is not read again
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the Get games download showed only a bare percentage, and re-read game data that was already checked
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-next)
+---
+ dm/ios/Shell/ShellStore.swift         | 36 +++++++++++++++------------
+ dm/ios/Sources/GameDataSyncCore.swift | 12 ++++++++-
+ 2 files changed, 31 insertions(+), 17 deletions(-)
+
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index 84c1d5d..a326f22 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -140,7 +140,7 @@ func untar(_ tar: URL, into dir: URL) throws {
+         let size = ByteCountFormatter.string(fromByteCount: g.framework.size, countStyle: .file)
+         if busy == id { return .server(status: "Downloading", detail: progress, action: "Downloading…", symbol: "arrow.down.circle") }
+         guard let have = installedBuild(id) else {
+-            return .server(status: "Not downloaded", detail: "Downloads \(size) of game code and the game's data from your server. Keep the app open while it downloads.",
++            return .server(status: "Not downloaded", detail: "Downloads \(size) of game code and shaders, then the game files, from your server. Keep the app open while it downloads.",
+                            action: "Download", symbol: "arrow.down.circle")
+         }
+         if have != stamp(g) {
+@@ -167,6 +167,22 @@ func untar(_ tar: URL, into dir: URL) throws {
+ 
+     /// Shows the progress in the library (in place, no re-sorting)
+     func showProgress(_ text: String) { progress = text; model.refreshAll() }
++    /// The progress line of one part: what it is doing (checking what is on the phone, or downloading), the size, the speed and the time left
++    private func watchProgress(_ what: String, _ sync: GameDataSync) async {
++        var last = sync.progress.fetched, lastT = Date(), speed = 0.0
++        while !Task.isCancelled {
++            let p = sync.progress, now = Date(), f = p.fetched, dt = now.timeIntervalSince(lastT)
++            if dt > 0.2 { let v = Double(f - last) / dt; speed = speed == 0 ? v : speed * 0.8 + v * 0.2; last = f; lastT = now }
++            let gb = { (b: Int64) in String(format: "%.1f", Double(b) / 1e9) }
++            var s = "\(what): " + (p.phase.hasPrefix("Checking") ? "checking what is on the phone, " : "") + "\(gb(p.done)) / \(gb(p.total)) GB"
++            if speed > 1e5 && !p.phase.hasPrefix("Checking") {
++                let left = Double(p.total - p.done) / speed
++                s += String(format: " · %.0f MB/s", speed / 1e6) + (left < 90 ? " · \(Int(left)) s left" : " · \(Int(left / 60)) min left")
++            }
++            showProgress(s)
++            try? await Task.sleep(for: .milliseconds(500))
++        }
++    }
+ 
+     /// The server's games for the library, with a local copy of each icon (the server asks for the token, the library reads files)
+     func publishToLibrary() async {
+@@ -271,25 +287,13 @@ func untar(_ tar: URL, into dir: URL) throws {
+             let codeCurrent = installedBuild(g.id) == stamp(g)
+             let staging = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("shell-downloads/\(g.id)", isDirectory: true)
+             let fsync = GameDataSync(servers: servers, token: token, gameDir: staging)
+-            let watch = Task { @MainActor in
+-                while !Task.isCancelled {
+-                    let p = fsync.progress
+-                    showProgress("Game code: \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%")
+-                    try? await Task.sleep(for: .milliseconds(500))
+-                }
+-            }
++            let watch = Task { @MainActor in await watchProgress("Game code and shaders", fsync) }
+             if !codeCurrent { try await fsync.syncFile(g.framework, base: base, name: "framework.tar") }
+             watch.cancel()
+             // 2. the game data, as the per-game app downloads it (romfs.img only: the shader libraries are inside the framework)
+             let dsync = GameDataSync(servers: servers, token: token, gameDir: gameDir(g.id))
+             let (m, url) = try await dsync.manifest(title: g.id, build: g.build)
+-            let watch2 = Task { @MainActor in
+-                while !Task.isCancelled {
+-                    let p = dsync.progress
+-                    showProgress("Game data: \(p.total > 0 ? Int(Double(p.done) * 100 / Double(p.total)) : 0)%")
+-                    try? await Task.sleep(for: .milliseconds(500))
+-                }
+-            }
++            let watch2 = Task { @MainActor in await watchProgress("Game files", dsync) }
+             try await dsync.syncFile(m.romfs, base: url, name: "romfs.img")
+             if let addOns = g.aoc, !addOns.isEmpty {   // the add-on content, from the shell catalogue, into games/<id>/aoc/
+                 try FileManager.default.createDirectory(at: gameDir(g.id).appendingPathComponent("aoc"), withIntermediateDirectories: true)
+@@ -370,7 +374,7 @@ struct ShellStoreView: View {
+             HStack {
+                 VStack(alignment: .leading) {
+                     Text(g.name)
+-                    Text("\(g.version) · \(ByteCountFormatter.string(fromByteCount: g.framework.size, countStyle: .file)) of game code")
++                    Text("\(g.version) · \(ByteCountFormatter.string(fromByteCount: g.framework.size, countStyle: .file)) of game code and shaders")
+                         .font(.caption).foregroundStyle(.secondary)
+                 }
+                 Spacer()
+diff --git a/dm/ios/Sources/GameDataSyncCore.swift b/dm/ios/Sources/GameDataSyncCore.swift
+index c3912a9..bc9d84f 100644
+--- a/dm/ios/Sources/GameDataSyncCore.swift
++++ b/dm/ios/Sources/GameDataSyncCore.swift
+@@ -242,16 +242,26 @@ final class GameDataSync: @unchecked Sendable {
+     }
+ 
+     /// Brings gameDir/<name> (romfs.img, msl.tar) to the manifest's file, fetched in this process.
++    /// A file checked in full once is not read again on the next download (an update, a game whose code alone changed): <name>.verified holds
++    /// the identity it was checked against, and the file's size has to match too
++    func verifiedURL(_ name: String) -> URL { gameDir.appendingPathComponent(name + ".verified") }
+     func syncFile(_ p: GameDataManifest.Part, base: URL, name: String, accepts: (URL) -> Bool = { _ in true }) async throws {
++        let id = p.identity ?? p.sha256, final = gameDir.appendingPathComponent(name), fm = FileManager.default
++        if (try? String(contentsOf: verifiedURL(name), encoding: .utf8)) == id && !fm.fileExists(atPath: partURL(name).path),
++           ((try? fm.attributesOfItem(atPath: final.path)[.size]) as? NSNumber)?.int64Value == p.size {
++            progress.set(phase: "Checking", total: progress.total + p.size); progress.add(done: p.size, fetched: 0); return
++        }
++        try? fm.removeItem(at: verifiedURL(name))
+         let todo = try await prepare(p, base: base, name: name)
+         try await fetchForeground(p, base: base, name: name, todo: todo)
+         try finish(name, accepts: accepts)
++        try? id.write(to: verifiedURL(name), atomically: true, encoding: .utf8)
+     }
+ 
+     /// Deletes the downloaded game data: the image, the shader libraries and any half-done download. The saves (games/<id>/save) stay.
+     func deleteGameData() throws {
+         let fm = FileManager.default
+-        for n in ["romfs.img", "romfs.img.part", "romfs.img.part.json", "romfs.img.part.plan.json", "msl.tar", "msl.tar.part", "msl.tar.part.json", "msl.tar.part.plan.json", "msl", "msl.part", "msl.part.json", "temp"] {
++        for n in ["romfs.img", "romfs.img.part", "romfs.img.part.json", "romfs.img.part.plan.json", "msl.tar", "msl.tar.part", "msl.tar.part.json", "msl.tar.part.plan.json", "msl", "msl.part", "msl.part.json", "romfs.img.verified", "msl.tar.verified", "temp"] {
+             let u = gameDir.appendingPathComponent(n)
+             if fm.fileExists(atPath: u.path) { try fm.removeItem(at: u) }
+         }

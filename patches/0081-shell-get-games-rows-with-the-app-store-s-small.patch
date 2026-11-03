@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Valtteri=20=C3=96stberg?=
+ <34726970+Valtterios@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 17:36:06 +0200
+Subject: [PATCH] Shell: Get games rows with the App Store's small blue pill,
+ and Remove in the game's settings and as a swipe, not as a row of its own
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: the Get games list looked disabled (grey filled buttons) and carried a Remove line under every downloaded game
+Issue: none (the fork Valtterios/NX2Apple has no issue tracker; branch duo-next)
+---
+ dm/ios/Shell/ShellStore.swift | 27 +++++++++++++--------------
+ 1 file changed, 13 insertions(+), 14 deletions(-)
+
+diff --git a/dm/ios/Shell/ShellStore.swift b/dm/ios/Shell/ShellStore.swift
+index a326f22..3f5f0af 100644
+--- a/dm/ios/Shell/ShellStore.swift
++++ b/dm/ios/Shell/ShellStore.swift
+@@ -339,7 +339,6 @@ enum ShellHostConfigPaths {
+ struct ShellStoreView: View {
+     @ObservedObject var store: ShellStore
+     @Environment(\.dismiss) private var dismiss
+-    @State private var confirming: String?
+ 
+     var body: some View {
+         NavigationStack {
+@@ -371,32 +370,32 @@ struct ShellStoreView: View {
+     @ViewBuilder func row(_ g: ShellCatalogue.Game) -> some View {
+         let have = store.installedBuild(g.id)
+         VStack(alignment: .leading, spacing: 4) {
+-            HStack {
+-                VStack(alignment: .leading) {
+-                    Text(g.name)
++            HStack(spacing: 12) {
++                VStack(alignment: .leading, spacing: 2) {
++                    Text(g.name).lineLimit(2)
+                     Text("\(g.version) · \(ByteCountFormatter.string(fromByteCount: g.framework.size, countStyle: .file)) of game code and shaders")
+                         .font(.caption).foregroundStyle(.secondary)
+                 }
+                 Spacer()
+                 if store.busy == g.id { ProgressView() }
+                 else if have == g.build && !store.dataReady(g.id) {
+-                    Button("Get data") { Task { await store.install(g) } }.buttonStyle(.borderedProminent).disabled(store.busy != nil)
++                    pill("Get data", g)
+                 } else if have == g.build {
+                     Text(frameworkSignature(store.executable(g.id)) == .certificate ? "Ready" : "Needs Force Sign")
+                         .font(.caption).foregroundStyle(frameworkSignature(store.executable(g.id)) == .certificate ? .green : .orange)
+                 } else {
+-                    Button(have == nil ? "Get" : "Update") { Task { await store.install(g) } }.buttonStyle(.borderedProminent).disabled(store.busy != nil)
++                    pill(have == nil ? "Get" : "Update", g)
+                 }
+             }
+             if store.busy == g.id { Text(store.progress).font(.caption).foregroundStyle(.secondary) }
+-            if have != nil && store.busy != g.id {   // in plain sight, not only as a swipe: what frees the space on the phone
+-                Button(role: .destructive) { confirming = g.id } label: { Label("Remove from this phone (saves stay)", systemImage: "trash") }
+-                    .font(.caption).buttonStyle(.borderless).disabled(store.busy != nil)
+-            }
+         }
+-        .swipeActions { if have != nil && store.busy == nil { Button("Remove", role: .destructive) { store.remove(g) } } }
+-        .confirmationDialog("Remove \(g.name)?", isPresented: Binding(get: { confirming == g.id }, set: { if !$0 { confirming = nil } }), titleVisibility: .visible) {
+-            Button("Remove", role: .destructive) { store.remove(g); confirming = nil }
+-        } message: { Text("Its game code and data are deleted from this phone. Your saves stay, and you can download it again.") }
++        .padding(.vertical, 2)
++        .swipeActions { if have != nil && store.busy == nil { Button("Remove", role: .destructive) { store.remove(g) } } }   // and in the game's settings
++    }
++
++    /// The App Store's small pill: tinted text on a light fill, so a row's action reads as a button and not as a disabled one
++    private func pill(_ title: String, _ g: ShellCatalogue.Game) -> some View {
++        Button { Task { await store.install(g) } } label: { Text(title).fontWeight(.semibold).frame(minWidth: 52) }
++            .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small).tint(.blue).disabled(store.busy != nil)
+     }
+ }
